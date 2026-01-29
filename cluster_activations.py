@@ -56,7 +56,7 @@ def get_assembly_from_filename(filename):
     return name.replace('_activations', '')
 
 
-def cluster_positions_hdbscan(positions, min_cluster_size=100, min_samples=10, cluster_selection_epsilon=500):
+def cluster_positions_hdbscan(positions, min_cluster_size=100, min_samples=10, cluster_selection_epsilon=0.0):
     """
     Cluster genomic positions using HDBSCAN.
 
@@ -64,7 +64,7 @@ def cluster_positions_hdbscan(positions, min_cluster_size=100, min_samples=10, c
         positions: 1D array of genomic positions
         min_cluster_size: Minimum number of positions to form a cluster
         min_samples: HDBSCAN min_samples parameter
-        cluster_selection_epsilon: Distance threshold for cluster merging in HDBSCAN
+        cluster_selection_epsilon: Distance threshold for cluster merging (0 = disabled)
 
     Returns:
         List of (start, end) tuples for each cluster
@@ -73,15 +73,20 @@ def cluster_positions_hdbscan(positions, min_cluster_size=100, min_samples=10, c
         return []
 
     # Reshape for sklearn (needs 2D input)
-    X = positions.reshape(-1, 1)
+    X = positions.reshape(-1, 1).astype(np.float64)
 
-    clusterer = HDBSCAN(
-        min_cluster_size=min_cluster_size,
-        min_samples=min_samples,
-        cluster_selection_epsilon=cluster_selection_epsilon,
-        metric='euclidean'
-    )
-    labels = clusterer.fit_predict(X)
+    try:
+        # Use simpler HDBSCAN config without epsilon
+        clusterer = HDBSCAN(
+            min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
+            metric='euclidean',
+            cluster_selection_method='eom'  # Excess of Mass
+        )
+        labels = clusterer.fit_predict(X)
+    except Exception as e:
+        print(f"    HDBSCAN failed: {e}")
+        return []
 
     # Extract regions from clusters
     regions = []
@@ -113,15 +118,20 @@ def cluster_positions_optics(positions, min_samples=50, xi=0.05, min_cluster_siz
     if len(positions) < min_cluster_size:
         return []
 
-    X = positions.reshape(-1, 1)
+    X = positions.reshape(-1, 1).astype(np.float64)
 
-    clusterer = OPTICS(
-        min_samples=min_samples,
-        xi=xi,
-        min_cluster_size=min_cluster_size,
-        metric='euclidean'
-    )
-    labels = clusterer.fit_predict(X)
+    try:
+        clusterer = OPTICS(
+            min_samples=min_samples,
+            xi=xi,
+            min_cluster_size=min_cluster_size,
+            metric='euclidean',
+            n_jobs=-1  # Use all cores
+        )
+        labels = clusterer.fit_predict(X)
+    except Exception as e:
+        print(f"    OPTICS failed: {e}")
+        return []
 
     regions = []
     unique_labels = set(labels)
@@ -262,8 +272,7 @@ def process_genome(activations, assembly_id, gt_regions, args):
     hdbscan_regions = cluster_positions_hdbscan(
         positions,
         min_cluster_size=args.min_cluster_size,
-        min_samples=args.min_samples,
-        cluster_selection_epsilon=args.cluster_epsilon
+        min_samples=args.min_samples
     )
     hdbscan_regions = merge_nearby_regions(hdbscan_regions, args.merge_distance)
     hdbscan_regions = filter_by_size(hdbscan_regions, args.min_region_size)
@@ -393,7 +402,6 @@ def main():
     # Clustering parameters
     parser.add_argument("--min_cluster_size", type=int, default=100, help="Minimum positions to form a cluster")
     parser.add_argument("--min_samples", type=int, default=20, help="HDBSCAN/OPTICS min_samples")
-    parser.add_argument("--cluster_epsilon", type=float, default=500, help="HDBSCAN cluster_selection_epsilon")
     parser.add_argument("--xi", type=float, default=0.05, help="OPTICS xi parameter")
 
     # Region filtering
