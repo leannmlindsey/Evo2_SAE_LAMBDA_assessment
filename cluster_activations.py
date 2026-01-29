@@ -645,6 +645,44 @@ def main():
         print(f"\nTotal regions predicted (Simple): {total_simple}")
         print(f"Total ground truth regions:       {total_gt}")
 
+        # Bin genomes by accuracy
+        print("\n" + "=" * 60)
+        print("GENOME ACCURACY BINS (by F1 score)")
+        print("=" * 60)
+
+        high_acc = [r for r in genomes_with_gt if r['simple_metrics']['f1'] >= 0.7]
+        med_acc = [r for r in genomes_with_gt if 0.3 <= r['simple_metrics']['f1'] < 0.7]
+        low_acc = [r for r in genomes_with_gt if r['simple_metrics']['f1'] < 0.3]
+
+        print(f"\nHigh accuracy (F1 >= 0.7): {len(high_acc)} genomes")
+        for r in sorted(high_acc, key=lambda x: -x['simple_metrics']['f1'])[:10]:
+            m = r['simple_metrics']
+            print(f"  {r['assembly']}: F1={m['f1']:.2f}, P={m['precision']:.2f}, R={m['recall']:.2f}, MCC={m['mcc']:.3f}")
+
+        print(f"\nMedium accuracy (0.3 <= F1 < 0.7): {len(med_acc)} genomes")
+        for r in sorted(med_acc, key=lambda x: -x['simple_metrics']['f1'])[:10]:
+            m = r['simple_metrics']
+            print(f"  {r['assembly']}: F1={m['f1']:.2f}, P={m['precision']:.2f}, R={m['recall']:.2f}, MCC={m['mcc']:.3f}")
+
+        print(f"\nLow accuracy (F1 < 0.3): {len(low_acc)} genomes")
+        for r in sorted(low_acc, key=lambda x: -x['simple_metrics']['f1'])[:10]:
+            m = r['simple_metrics']
+            print(f"  {r['assembly']}: F1={m['f1']:.2f}, P={m['precision']:.2f}, R={m['recall']:.2f}, MCC={m['mcc']:.3f}")
+
+        # Save binned results to separate files
+        bins_dir = output_dir / "accuracy_bins"
+        bins_dir.mkdir(exist_ok=True)
+
+        for bin_name, bin_data in [("high", high_acc), ("medium", med_acc), ("low", low_acc)]:
+            bin_file = bins_dir / f"{bin_name}_accuracy_genomes.txt"
+            with open(bin_file, 'w') as f:
+                f.write(f"# {bin_name.upper()} accuracy genomes (F1-based)\n")
+                f.write("# assembly\tF1\tprecision\trecall\tMCC\tgt_regions\tpred_regions\n")
+                for r in sorted(bin_data, key=lambda x: -x['simple_metrics']['f1']):
+                    m = r['simple_metrics']
+                    f.write(f"{r['assembly']}\t{m['f1']:.3f}\t{m['precision']:.3f}\t{m['recall']:.3f}\t{m['mcc']:.3f}\t{m['gt_total']}\t{m['pred_total']}\n")
+            print(f"\nSaved {bin_name} accuracy list to: {bin_file}")
+
     print(f"\nResults saved to: {output_dir}")
     print(f"BED files: {bed_dir}")
     if not args.no_plots:
