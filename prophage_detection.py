@@ -376,8 +376,8 @@ class ProphageDetector:
         merge_dist = self.config.merge_distance
 
         # Calculate density of activations using sliding window
-        window_size = 1000  # 1kb sliding window for density calculation
-        density_threshold = 0.005  # 0.5% of positions in window must be above threshold
+        window_size = 2000  # 2kb sliding window for density calculation
+        density_threshold = 0.002  # 0.2% of positions in window must be above threshold
 
         # Binary: positions above threshold
         above = (activations > threshold).astype(float)
