@@ -44,8 +44,7 @@ class Config:
     genome_dir: str = ""
     output_dir: str = "./prophage_results"
     ground_truth: Optional[str] = None
-    # Use EVO2_BASE_DIR env var if set, otherwise use script directory
-    sae_weights_dir: str = ""  # Will be set in __post_init__ or main()
+    sae_weights_dir: str = "/home/lindseylm/evo2/sae_weights"
     
     # Model
     model_name: str = "evo2_7b"
@@ -552,20 +551,10 @@ Examples:
                         help="Minimum prophage length (bp)")
     parser.add_argument("--save_activations", action="store_true",
                         help="Save raw activation arrays")
-    parser.add_argument("--sae_weights_dir", type=str, default=None,
-                        help="Directory containing SAE weights (default: ./sae_weights or EVO2_BASE_DIR)")
+    parser.add_argument("--sae_weights_dir", type=str, default="/home/lindseylm/evo2/sae_weights",
+                        help="Directory containing SAE weights")
 
     args = parser.parse_args()
-
-    # Determine SAE weights directory
-    if args.sae_weights_dir:
-        sae_weights_dir = args.sae_weights_dir
-    elif os.environ.get("EVO2_BASE_DIR"):
-        sae_weights_dir = str(Path(os.environ["EVO2_BASE_DIR"]) / "sae_weights")
-    else:
-        # Default to script directory
-        script_dir = Path(__file__).resolve().parent
-        sae_weights_dir = str(script_dir / "sae_weights")
 
     # Setup config
     config = Config(
@@ -577,7 +566,7 @@ Examples:
         activation_threshold=args.threshold,
         min_prophage_length=args.min_length,
         save_activations=args.save_activations,
-        sae_weights_dir=sae_weights_dir,
+        sae_weights_dir=args.sae_weights_dir,
     )
     
     # Create output directory
