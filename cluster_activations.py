@@ -56,6 +56,67 @@ def get_assembly_from_filename(filename):
     return name.replace('_activations', '')
 
 
+def cluster_mws(activations, window=85, threshold=0.4, min_region_size=1000, merge_distance=3000):
+    """
+    Moving Window Sum (MWS) algorithm from Phoenix dashboard.
+
+    1. Apply rolling window sum normalized by window size (equivalent to rolling mean)
+    2. Threshold to get binary predictions
+    3. Find contiguous regions
+    4. Filter by min size and merge nearby regions
+
+    Args:
+        activations: Raw activation values per nucleotide
+        window: Rolling window size (default 85 from Phoenix)
+        threshold: Threshold for binary classification (default 0.4 from Phoenix)
+        min_region_size: Minimum region size in bp
+        merge_distance: Merge regions within this distance
+
+    Returns:
+        List of (start, end) tuples
+    """
+    import pandas as pd
+
+    # Step 1: Rolling window sum normalized by window size
+    df = pd.DataFrame({'act': activations})
+    df['smoothed'] = df['act'].rolling(window=window, center=True, min_periods=1).sum() / window
+    df['smoothed'] = df['smoothed'].fillna(0)
+
+    # Step 2: Threshold to binary
+    binary = (df['smoothed'] > threshold).values
+
+    # Step 3: Find contiguous regions
+    regions = []
+    in_region = False
+    start = 0
+
+    for i, is_positive in enumerate(binary):
+        if is_positive and not in_region:
+            start = i
+            in_region = True
+        elif not is_positive and in_region:
+            regions.append((start, i))
+            in_region = False
+
+    if in_region:
+        regions.append((start, len(binary)))
+
+    # Step 4: Merge nearby regions
+    if regions:
+        merged = [list(regions[0])]
+        for start, end in regions[1:]:
+            if start - merged[-1][1] <= merge_distance:
+                merged[-1][1] = end
+            else:
+                merged.append([start, end])
+        regions = [(s, e) for s, e in merged]
+
+    # Step 5: Filter by minimum size
+    regions = [(s, e) for s, e in regions if e - s >= min_region_size]
+
+    return regions
+
+
 def cluster_positions_simple(positions, max_gap=100):
     """
     Simple O(n) clustering for 1D genomic positions.
@@ -294,7 +355,7 @@ def process_genome(activations, assembly_id, gt_regions, args):
 
     seq_len = len(activations)
 
-    # Find positions above threshold
+    # Find positions above threshold (for simple clustering)
     positions = np.where(activations > args.threshold)[0]
 
     results = {
@@ -303,6 +364,21 @@ def process_genome(activations, assembly_id, gt_regions, args):
         'positions_above_threshold': len(positions),
         'gt_regions': len(gt_regions),
     }
+
+    # MWS clustering (Moving Window Sum from Phoenix) - works on raw activations
+    if args.use_mws:
+        mws_regions = cluster_mws(
+            activations,
+            window=args.mws_window,
+            threshold=args.mws_threshold,
+            min_region_size=args.min_region_size,
+            merge_distance=args.merge_distance
+        )
+        results['mws_regions'] = mws_regions
+        results['mws_metrics'] = calculate_metrics(mws_regions, gt_regions, seq_len)
+    else:
+        results['mws_regions'] = []
+        results['mws_metrics'] = {}
 
     if len(positions) == 0:
         results['simple_regions'] = []
@@ -361,8 +437,8 @@ def save_bed(regions, output_path, assembly_id):
             f.write(f"{assembly_id}\t{start}\t{end}\t{name}\t0\t+\n")
 
 
-def plot_comparison(activations, simple_regions, hdbscan_regions, gt_regions,
-                    assembly_id, output_path, threshold):
+def plot_comparison(activations, simple_regions, second_regions, gt_regions,
+                    assembly_id, output_path, threshold, second_method_name="HDBSCAN"):
     """Generate comparison plot showing clustering results vs ground truth."""
 
     seq_len = len(activations)
@@ -407,19 +483,19 @@ def plot_comparison(activations, simple_regions, hdbscan_regions, gt_regions,
     if not simple_regions:
         ax2.text(0.5, 0.5, 'No regions', transform=ax2.transAxes, ha='center', va='center', color='gray')
 
-    # HDBSCAN regions (if available)
+    # Second method regions (MWS or HDBSCAN)
     ax3 = axes[2]
     ax3.set_xlim(0, seq_len)
     ax3.set_ylim(0, 1)
-    ax3.set_ylabel('HDBSCAN')
+    ax3.set_ylabel(second_method_name)
     ax3.set_yticks([])
-    for start, end in hdbscan_regions:
+    for start, end in second_regions:
         ax3.axvspan(start, end, alpha=0.7, color='purple')
         mid = (start + end) / 2
         size_kb = (end - start) / 1000
         ax3.text(mid, 0.5, f'{size_kb:.1f}kb', ha='center', va='center', fontsize=7, color='white', fontweight='bold')
-    if not hdbscan_regions:
-        ax3.text(0.5, 0.5, 'Not run (use --use_hdbscan)', transform=ax3.transAxes, ha='center', va='center', color='gray')
+    if not second_regions:
+        ax3.text(0.5, 0.5, f'Not run (use --use_mws or --use_hdbscan)', transform=ax3.transAxes, ha='center', va='center', color='gray')
 
     # Ground truth
     ax4 = axes[3]
@@ -459,6 +535,9 @@ def main():
 
     # Clustering parameters
     parser.add_argument("--max_gap", type=int, default=100, help="Max gap between positions in simple clustering (default: 100bp)")
+    parser.add_argument("--use_mws", action="store_true", help="Use Moving Window Sum algorithm (from Phoenix dashboard)")
+    parser.add_argument("--mws_window", type=int, default=85, help="MWS rolling window size (default: 85 from Phoenix)")
+    parser.add_argument("--mws_threshold", type=float, default=0.4, help="MWS threshold (default: 0.4 from Phoenix)")
     parser.add_argument("--use_hdbscan", action="store_true", help="Also run HDBSCAN clustering (slow)")
     parser.add_argument("--use_optics", action="store_true", help="Also run OPTICS clustering (slow)")
     parser.add_argument("--min_cluster_size", type=int, default=100, help="Minimum positions for HDBSCAN/OPTICS")
@@ -538,6 +617,8 @@ def main():
         # Save BED files
         if results['simple_regions']:
             save_bed(results['simple_regions'], bed_dir / f"{assembly_id}_simple.bed", assembly_id)
+        if results.get('mws_regions'):
+            save_bed(results['mws_regions'], bed_dir / f"{assembly_id}_mws.bed", assembly_id)
         if results.get('hdbscan_regions'):
             save_bed(results['hdbscan_regions'], bed_dir / f"{assembly_id}_hdbscan.bed", assembly_id)
         if results.get('optics_regions'):
@@ -545,14 +626,18 @@ def main():
 
         # Generate plot
         if not args.no_plots:
+            # Use MWS regions if available, otherwise HDBSCAN
+            second_method_regions = results.get('mws_regions', []) if args.use_mws else results.get('hdbscan_regions', [])
+            second_method_name = "MWS" if args.use_mws else "HDBSCAN"
             plot_comparison(
                 activations,
                 results['simple_regions'],
-                results.get('hdbscan_regions', []),
+                second_method_regions,
                 gt_regions,
                 assembly_id,
                 plots_dir / f"{assembly_id}_clusters.png",
-                args.threshold
+                args.threshold,
+                second_method_name
             )
 
     # Save results
@@ -569,17 +654,30 @@ def main():
     print(f"Genomes with ground truth: {len(genomes_with_gt)} / {len(all_results)}")
 
     if genomes_with_gt:
-        print("\nSimple Clustering Performance:")
+        print("\nSimple Clustering Performance (threshold={}, max_gap={}):".format(args.threshold, args.max_gap))
         simple_precision = np.mean([r['simple_metrics']['precision'] for r in genomes_with_gt])
         simple_recall = np.mean([r['simple_metrics']['recall'] for r in genomes_with_gt])
         simple_f1 = np.mean([r['simple_metrics']['f1'] for r in genomes_with_gt])
         simple_mcc = np.mean([r['simple_metrics']['mcc'] for r in genomes_with_gt])
         simple_jaccard = np.mean([r['simple_metrics']['jaccard'] for r in genomes_with_gt])
-        print(f"  Precision (region): {simple_precision:.1%}")
-        print(f"  Recall (region):    {simple_recall:.1%}")
-        print(f"  F1 (region):        {simple_f1:.1%}")
-        print(f"  MCC (base-pair):    {simple_mcc:.3f}")
-        print(f"  Jaccard (base-pair):{simple_jaccard:.3f}")
+        print(f"  Precision: {simple_precision:.1%}")
+        print(f"  Recall:    {simple_recall:.1%}")
+        print(f"  F1:        {simple_f1:.1%}")
+        print(f"  MCC:       {simple_mcc:.3f}")
+        print(f"  Jaccard:   {simple_jaccard:.3f}")
+
+        if args.use_mws:
+            print("\nMWS Clustering Performance (window={}, threshold={}):".format(args.mws_window, args.mws_threshold))
+            mws_precision = np.mean([r['mws_metrics']['precision'] for r in genomes_with_gt])
+            mws_recall = np.mean([r['mws_metrics']['recall'] for r in genomes_with_gt])
+            mws_f1 = np.mean([r['mws_metrics']['f1'] for r in genomes_with_gt])
+            mws_mcc = np.mean([r['mws_metrics']['mcc'] for r in genomes_with_gt])
+            mws_jaccard = np.mean([r['mws_metrics']['jaccard'] for r in genomes_with_gt])
+            print(f"  Precision: {mws_precision:.1%}")
+            print(f"  Recall:    {mws_recall:.1%}")
+            print(f"  F1:        {mws_f1:.1%}")
+            print(f"  MCC:       {mws_mcc:.3f}")
+            print(f"  Jaccard:   {mws_jaccard:.3f}")
 
         if args.use_hdbscan:
             print("\nHDBSCAN Performance:")
