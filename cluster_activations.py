@@ -56,6 +56,46 @@ def get_assembly_from_filename(filename):
     return name.replace('_activations', '')
 
 
+def cluster_positions_simple(positions, max_gap=100):
+    """
+    Simple O(n) clustering for 1D genomic positions.
+
+    Groups positions that are within max_gap of each other into regions.
+    Much faster than HDBSCAN/OPTICS for genomic data.
+
+    Args:
+        positions: 1D array of genomic positions (must be sorted)
+        max_gap: Maximum gap between positions to consider them part of same cluster
+
+    Returns:
+        List of (start, end) tuples for each cluster
+    """
+    if len(positions) == 0:
+        return []
+
+    positions = np.sort(positions)
+    regions = []
+
+    # Start first region
+    region_start = positions[0]
+    region_end = positions[0]
+
+    for pos in positions[1:]:
+        if pos - region_end <= max_gap:
+            # Extend current region
+            region_end = pos
+        else:
+            # Save current region and start new one
+            regions.append((int(region_start), int(region_end)))
+            region_start = pos
+            region_end = pos
+
+    # Don't forget the last region
+    regions.append((int(region_start), int(region_end)))
+
+    return regions
+
+
 def cluster_positions_hdbscan(positions, min_cluster_size=100, min_samples=10, cluster_selection_epsilon=0.0):
     """
     Cluster genomic positions using HDBSCAN.
@@ -261,36 +301,51 @@ def process_genome(activations, assembly_id, gt_regions, args):
         'gt_regions': len(gt_regions),
     }
 
-    if len(positions) < args.min_cluster_size:
+    if len(positions) == 0:
+        results['simple_regions'] = []
         results['hdbscan_regions'] = []
         results['optics_regions'] = []
+        results['simple_metrics'] = calculate_metrics([], gt_regions, seq_len)
         results['hdbscan_metrics'] = calculate_metrics([], gt_regions, seq_len)
         results['optics_metrics'] = calculate_metrics([], gt_regions, seq_len)
         return results
 
-    # HDBSCAN clustering
-    hdbscan_regions = cluster_positions_hdbscan(
-        positions,
-        min_cluster_size=args.min_cluster_size,
-        min_samples=args.min_samples
-    )
-    hdbscan_regions = merge_nearby_regions(hdbscan_regions, args.merge_distance)
-    hdbscan_regions = filter_by_size(hdbscan_regions, args.min_region_size)
+    # Simple clustering (fast, O(n))
+    simple_regions = cluster_positions_simple(positions, max_gap=args.max_gap)
+    simple_regions = merge_nearby_regions(simple_regions, args.merge_distance)
+    simple_regions = filter_by_size(simple_regions, args.min_region_size)
+    results['simple_regions'] = simple_regions
+    results['simple_metrics'] = calculate_metrics(simple_regions, gt_regions, seq_len)
 
-    # OPTICS clustering
-    optics_regions = cluster_positions_optics(
-        positions,
-        min_samples=args.min_samples,
-        xi=args.xi,
-        min_cluster_size=args.min_cluster_size
-    )
-    optics_regions = merge_nearby_regions(optics_regions, args.merge_distance)
-    optics_regions = filter_by_size(optics_regions, args.min_region_size)
+    # HDBSCAN/OPTICS only if requested (slow)
+    if args.use_hdbscan:
+        hdbscan_regions = cluster_positions_hdbscan(
+            positions,
+            min_cluster_size=args.min_cluster_size,
+            min_samples=args.min_samples
+        )
+        hdbscan_regions = merge_nearby_regions(hdbscan_regions, args.merge_distance)
+        hdbscan_regions = filter_by_size(hdbscan_regions, args.min_region_size)
+        results['hdbscan_regions'] = hdbscan_regions
+        results['hdbscan_metrics'] = calculate_metrics(hdbscan_regions, gt_regions, seq_len)
+    else:
+        results['hdbscan_regions'] = []
+        results['hdbscan_metrics'] = {}
 
-    results['hdbscan_regions'] = hdbscan_regions
-    results['optics_regions'] = optics_regions
-    results['hdbscan_metrics'] = calculate_metrics(hdbscan_regions, gt_regions, seq_len)
-    results['optics_metrics'] = calculate_metrics(optics_regions, gt_regions, seq_len)
+    if args.use_optics:
+        optics_regions = cluster_positions_optics(
+            positions,
+            min_samples=args.min_samples,
+            xi=args.xi,
+            min_cluster_size=args.min_cluster_size
+        )
+        optics_regions = merge_nearby_regions(optics_regions, args.merge_distance)
+        optics_regions = filter_by_size(optics_regions, args.min_region_size)
+        results['optics_regions'] = optics_regions
+        results['optics_metrics'] = calculate_metrics(optics_regions, gt_regions, seq_len)
+    else:
+        results['optics_regions'] = []
+        results['optics_metrics'] = {}
 
     return results
 
@@ -303,7 +358,7 @@ def save_bed(regions, output_path, assembly_id):
             f.write(f"{assembly_id}\t{start}\t{end}\t{name}\t0\t+\n")
 
 
-def plot_comparison(activations, hdbscan_regions, optics_regions, gt_regions,
+def plot_comparison(activations, simple_regions, hdbscan_regions, gt_regions,
                     assembly_id, output_path, threshold):
     """Generate comparison plot showing clustering results vs ground truth."""
 
@@ -335,33 +390,33 @@ def plot_comparison(activations, hdbscan_regions, optics_regions, gt_regions,
     ax1.legend(loc='upper right')
     ax1.grid(True, alpha=0.3)
 
-    # HDBSCAN regions
+    # Simple clustering regions (fast method)
     ax2 = axes[1]
     ax2.set_xlim(0, seq_len)
     ax2.set_ylim(0, 1)
-    ax2.set_ylabel('HDBSCAN')
+    ax2.set_ylabel('Predicted')
     ax2.set_yticks([])
-    for start, end in hdbscan_regions:
+    for start, end in simple_regions:
         ax2.axvspan(start, end, alpha=0.7, color='green')
         mid = (start + end) / 2
         size_kb = (end - start) / 1000
         ax2.text(mid, 0.5, f'{size_kb:.1f}kb', ha='center', va='center', fontsize=7, color='white', fontweight='bold')
-    if not hdbscan_regions:
+    if not simple_regions:
         ax2.text(0.5, 0.5, 'No regions', transform=ax2.transAxes, ha='center', va='center', color='gray')
 
-    # OPTICS regions
+    # HDBSCAN regions (if available)
     ax3 = axes[2]
     ax3.set_xlim(0, seq_len)
     ax3.set_ylim(0, 1)
-    ax3.set_ylabel('OPTICS')
+    ax3.set_ylabel('HDBSCAN')
     ax3.set_yticks([])
-    for start, end in optics_regions:
+    for start, end in hdbscan_regions:
         ax3.axvspan(start, end, alpha=0.7, color='purple')
         mid = (start + end) / 2
         size_kb = (end - start) / 1000
         ax3.text(mid, 0.5, f'{size_kb:.1f}kb', ha='center', va='center', fontsize=7, color='white', fontweight='bold')
-    if not optics_regions:
-        ax3.text(0.5, 0.5, 'No regions', transform=ax3.transAxes, ha='center', va='center', color='gray')
+    if not hdbscan_regions:
+        ax3.text(0.5, 0.5, 'Not run (use --use_hdbscan)', transform=ax3.transAxes, ha='center', va='center', color='gray')
 
     # Ground truth
     ax4 = axes[3]
@@ -400,7 +455,10 @@ def main():
     parser.add_argument("--threshold", type=float, default=0.3, help="Activation threshold (default: 0.3)")
 
     # Clustering parameters
-    parser.add_argument("--min_cluster_size", type=int, default=100, help="Minimum positions to form a cluster")
+    parser.add_argument("--max_gap", type=int, default=100, help="Max gap between positions in simple clustering (default: 100bp)")
+    parser.add_argument("--use_hdbscan", action="store_true", help="Also run HDBSCAN clustering (slow)")
+    parser.add_argument("--use_optics", action="store_true", help="Also run OPTICS clustering (slow)")
+    parser.add_argument("--min_cluster_size", type=int, default=100, help="Minimum positions for HDBSCAN/OPTICS")
     parser.add_argument("--min_samples", type=int, default=20, help="HDBSCAN/OPTICS min_samples")
     parser.add_argument("--xi", type=float, default=0.05, help="OPTICS xi parameter")
 
@@ -475,17 +533,19 @@ def main():
         all_results.append(results)
 
         # Save BED files
-        if results['hdbscan_regions']:
+        if results['simple_regions']:
+            save_bed(results['simple_regions'], bed_dir / f"{assembly_id}_simple.bed", assembly_id)
+        if results.get('hdbscan_regions'):
             save_bed(results['hdbscan_regions'], bed_dir / f"{assembly_id}_hdbscan.bed", assembly_id)
-        if results['optics_regions']:
+        if results.get('optics_regions'):
             save_bed(results['optics_regions'], bed_dir / f"{assembly_id}_optics.bed", assembly_id)
 
         # Generate plot
         if not args.no_plots:
             plot_comparison(
                 activations,
-                results['hdbscan_regions'],
-                results['optics_regions'],
+                results['simple_regions'],
+                results.get('hdbscan_regions', []),
                 gt_regions,
                 assembly_id,
                 plots_dir / f"{assembly_id}_clusters.png",
@@ -506,29 +566,37 @@ def main():
     print(f"Genomes with ground truth: {len(genomes_with_gt)} / {len(all_results)}")
 
     if genomes_with_gt:
-        print("\nHDBSCAN Performance:")
-        hdb_precision = np.mean([r['hdbscan_metrics']['precision'] for r in genomes_with_gt])
-        hdb_recall = np.mean([r['hdbscan_metrics']['recall'] for r in genomes_with_gt])
-        hdb_f1 = np.mean([r['hdbscan_metrics']['f1'] for r in genomes_with_gt])
-        print(f"  Precision: {hdb_precision:.1%}")
-        print(f"  Recall:    {hdb_recall:.1%}")
-        print(f"  F1:        {hdb_f1:.1%}")
+        print("\nSimple Clustering Performance:")
+        simple_precision = np.mean([r['simple_metrics']['precision'] for r in genomes_with_gt])
+        simple_recall = np.mean([r['simple_metrics']['recall'] for r in genomes_with_gt])
+        simple_f1 = np.mean([r['simple_metrics']['f1'] for r in genomes_with_gt])
+        print(f"  Precision: {simple_precision:.1%}")
+        print(f"  Recall:    {simple_recall:.1%}")
+        print(f"  F1:        {simple_f1:.1%}")
 
-        print("\nOPTICS Performance:")
-        opt_precision = np.mean([r['optics_metrics']['precision'] for r in genomes_with_gt])
-        opt_recall = np.mean([r['optics_metrics']['recall'] for r in genomes_with_gt])
-        opt_f1 = np.mean([r['optics_metrics']['f1'] for r in genomes_with_gt])
-        print(f"  Precision: {opt_precision:.1%}")
-        print(f"  Recall:    {opt_recall:.1%}")
-        print(f"  F1:        {opt_f1:.1%}")
+        if args.use_hdbscan:
+            print("\nHDBSCAN Performance:")
+            hdb_precision = np.mean([r['hdbscan_metrics'].get('precision', 0) for r in genomes_with_gt])
+            hdb_recall = np.mean([r['hdbscan_metrics'].get('recall', 0) for r in genomes_with_gt])
+            hdb_f1 = np.mean([r['hdbscan_metrics'].get('f1', 0) for r in genomes_with_gt])
+            print(f"  Precision: {hdb_precision:.1%}")
+            print(f"  Recall:    {hdb_recall:.1%}")
+            print(f"  F1:        {hdb_f1:.1%}")
+
+        if args.use_optics:
+            print("\nOPTICS Performance:")
+            opt_precision = np.mean([r['optics_metrics'].get('precision', 0) for r in genomes_with_gt])
+            opt_recall = np.mean([r['optics_metrics'].get('recall', 0) for r in genomes_with_gt])
+            opt_f1 = np.mean([r['optics_metrics'].get('f1', 0) for r in genomes_with_gt])
+            print(f"  Precision: {opt_precision:.1%}")
+            print(f"  Recall:    {opt_recall:.1%}")
+            print(f"  F1:        {opt_f1:.1%}")
 
         # Count total regions
-        total_hdb = sum(len(r['hdbscan_regions']) for r in all_results)
-        total_opt = sum(len(r['optics_regions']) for r in all_results)
+        total_simple = sum(len(r['simple_regions']) for r in all_results)
         total_gt = sum(r['gt_regions'] for r in genomes_with_gt)
-        print(f"\nTotal regions predicted (HDBSCAN): {total_hdb}")
-        print(f"Total regions predicted (OPTICS):  {total_opt}")
-        print(f"Total ground truth regions:        {total_gt}")
+        print(f"\nTotal regions predicted (Simple): {total_simple}")
+        print(f"Total ground truth regions:       {total_gt}")
 
     print(f"\nResults saved to: {output_dir}")
     print(f"BED files: {bed_dir}")
