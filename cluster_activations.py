@@ -439,8 +439,15 @@ def save_bed(regions, output_path, assembly_id):
 
 
 def plot_comparison(activations, simple_regions, second_regions, gt_regions,
-                    assembly_id, output_path, threshold, second_method_name="HDBSCAN"):
-    """Generate comparison plot showing clustering results vs ground truth."""
+                    assembly_id, output_path, threshold, second_method_name="HDBSCAN",
+                    metrics=None, taxonomy=None, gc_content=None):
+    """Generate comparison plot showing clustering results vs ground truth.
+
+    Args:
+        metrics: dict with 'precision', 'recall', 'mcc', 'f1' keys
+        taxonomy: organism name string
+        gc_content: GC content as float (0-1)
+    """
 
     seq_len = len(activations)
 
@@ -459,13 +466,43 @@ def plot_comparison(activations, simple_regions, second_regions, gt_regions,
 
     fig, axes = plt.subplots(4, 1, figsize=(20, 10), height_ratios=[3, 1, 1, 1], sharex=True)
 
+    # Build title with metrics and taxonomy
+    title_parts = [assembly_id]
+    if taxonomy and taxonomy not in ('Unknown', 'N/A', ''):
+        # Extract genus + species (first two words)
+        tax_short = ' '.join(taxonomy.split()[:2])
+        if len(tax_short) > 35:
+            tax_short = tax_short[:32] + "..."
+        title_parts.append(tax_short)
+
+    title_line1 = " - ".join(title_parts)
+
+    # Metrics line
+    metrics_parts = []
+    if metrics:
+        if metrics.get('precision') is not None:
+            metrics_parts.append(f"P:{metrics['precision']:.3f}")
+        if metrics.get('recall') is not None:
+            metrics_parts.append(f"R:{metrics['recall']:.3f}")
+        if metrics.get('mcc') is not None:
+            metrics_parts.append(f"MCC:{metrics['mcc']:.3f}")
+    if gc_content is not None:
+        metrics_parts.append(f"GC:{gc_content:.1%}")
+
+    title_line2 = "  ".join(metrics_parts) if metrics_parts else ""
+
+    # Combine title
+    full_title = title_line1
+    if title_line2:
+        full_title += f"\n{title_line2}"
+
     # Top: Activation signal
     ax1 = axes[0]
     ax1.fill_between(x_coords, 0, plot_acts, alpha=0.3, color='blue')
     ax1.plot(x_coords, plot_acts, lw=0.5, alpha=0.9, color='blue')
     ax1.axhline(y=threshold, color='red', linestyle='--', alpha=0.5, label=f'Threshold ({threshold})')
     ax1.set_ylabel('SAE Activation')
-    ax1.set_title(f'{assembly_id} - Clustering Comparison')
+    ax1.set_title(full_title, fontsize=12, fontweight='bold')
     ax1.set_xlim(0, seq_len)
     ax1.legend(loc='upper right')
     ax1.grid(True, alpha=0.3)
@@ -630,6 +667,15 @@ def main():
             # Use MWS regions if available, otherwise HDBSCAN
             second_method_regions = results.get('mws_regions', []) if args.use_mws else results.get('hdbscan_regions', [])
             second_method_name = "MWS" if args.use_mws else "HDBSCAN"
+
+            # Get taxonomy from ground truth (use first region's organism)
+            taxonomy = None
+            if gt_regions and gt_regions[0].get('organism'):
+                taxonomy = gt_regions[0]['organism']
+
+            # Get metrics for the primary method (simple clustering)
+            metrics = results.get('simple_metrics', {})
+
             plot_comparison(
                 activations,
                 results['simple_regions'],
@@ -638,7 +684,10 @@ def main():
                 assembly_id,
                 plots_dir / f"{assembly_id}_clusters.png",
                 args.threshold,
-                second_method_name
+                second_method_name,
+                metrics=metrics,
+                taxonomy=taxonomy,
+                gc_content=None  # GC content requires FASTA files
             )
 
     # Save results
