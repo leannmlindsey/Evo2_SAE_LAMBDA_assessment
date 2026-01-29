@@ -98,12 +98,14 @@ class SAEModule(torch.nn.Module):
         # x: (..., d_model) -> pre_acts: (..., d_sae)
         pre_acts = torch.nn.functional.linear(x, self.W_enc, self.b_enc)
 
-        # TopK activation
-        topk_values, topk_indices = torch.topk(pre_acts, self.k, dim=-1)
-        acts = torch.zeros_like(pre_acts)
+        # TopK activation - convert to float32 for topk (bfloat16 not supported)
+        original_dtype = pre_acts.dtype
+        pre_acts_f32 = pre_acts.float()
+        topk_values, topk_indices = torch.topk(pre_acts_f32, self.k, dim=-1)
+        acts = torch.zeros_like(pre_acts_f32)
         acts.scatter_(-1, topk_indices, torch.relu(topk_values))
 
-        return acts
+        return acts.to(original_dtype)
 
     def decode(self, acts: torch.Tensor) -> torch.Tensor:
         """Reconstruct from sparse activations."""
