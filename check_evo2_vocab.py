@@ -14,44 +14,47 @@ print("\n" + "=" * 60)
 print("Evo2 Tokenizer Info")
 print("=" * 60)
 
-# Check common attributes
 print(f"\nTokenizer type: {type(tokenizer)}")
-
-# Try to get vocab size
-if hasattr(tokenizer, 'vocab_size'):
-    print(f"vocab_size attribute: {tokenizer.vocab_size}")
-
-if hasattr(tokenizer, '__len__'):
-    print(f"len(tokenizer): {len(tokenizer)}")
-
-if hasattr(tokenizer, 'get_vocab'):
-    vocab = tokenizer.get_vocab()
-    print(f"get_vocab() size: {len(vocab)}")
-    print(f"Vocabulary: {vocab}")
-
-if hasattr(tokenizer, 'vocab'):
-    print(f"vocab attribute: {tokenizer.vocab}")
+print(f"vocab_size: {tokenizer.vocab_size}")
 
 # Try tokenizing each base
 print("\n" + "=" * 60)
-print("Token IDs for DNA bases")
+print("Token IDs for DNA bases and sequences")
 print("=" * 60)
 
-test_seqs = ['A', 'T', 'C', 'G', 'N', 'ATCG', 'NNNN', 'ATCGATCG']
+test_seqs = ['A', 'T', 'C', 'G', 'N', 'a', 't', 'c', 'g', 'ATCG', 'atcg', 'NNNN', 'ATCGATCG']
 for seq in test_seqs:
-    tokens = tokenizer.tokenize(seq)
-    print(f"  '{seq}' -> {tokens}")
+    try:
+        tokens = tokenizer.tokenize(seq)
+        print(f"  '{seq}' -> {tokens}")
+    except Exception as e:
+        print(f"  '{seq}' -> ERROR: {e}")
 
-# Check all attributes
+# Check what ASCII characters map to what tokens
 print("\n" + "=" * 60)
-print("All tokenizer attributes")
+print("ASCII character token mappings (printable chars)")
 print("=" * 60)
-for attr in dir(tokenizer):
-    if not attr.startswith('_'):
+
+for i in range(32, 127):
+    char = chr(i)
+    try:
+        tokens = tokenizer.tokenize(char)
+        print(f"  '{char}' (ASCII {i}) -> {tokens}")
+    except Exception as e:
+        print(f"  '{char}' (ASCII {i}) -> ERROR: {e}")
+
+# Check safe attributes only
+print("\n" + "=" * 60)
+print("Safe tokenizer attributes")
+print("=" * 60)
+
+safe_attrs = ['vocab_size', 'pad_token_id', 'eos_token_id', 'bos_token_id',
+              'unk_token_id', 'mask_token_id', 'cls_token_id', 'sep_token_id']
+for attr in safe_attrs:
+    if hasattr(tokenizer, attr):
         try:
             val = getattr(tokenizer, attr)
-            if not callable(val):
-                print(f"  {attr}: {val}")
+            print(f"  {attr}: {val}")
         except:
             pass
 
