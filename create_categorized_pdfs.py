@@ -125,35 +125,41 @@ def calculate_gc_from_fasta(fasta_path):
     return gc_count / len(sequence)
 
 
-def categorize_genomes_from_stats(genome_stats, high_thresh=0.7, low_thresh=0.3):
-    """Categorize genomes using genome_stats.csv (preferred method with F1 scores)."""
+def categorize_genomes_from_stats(genome_stats, high_thresh=0.7, low_thresh=0.3, use_mcc=True):
+    """Categorize genomes using genome_stats.csv (preferred method with MCC scores)."""
     categories = {'high': [], 'medium': [], 'low': []}
 
     for assembly, stats in genome_stats.items():
-        f1 = stats.get('f1')
-        if f1 is None:
+        # Prefer MCC for categorization, fall back to F1
+        if use_mcc and stats.get('mcc') is not None:
+            metric_value = stats.get('mcc')
+        else:
+            metric_value = stats.get('f1')
+
+        if metric_value is None:
             continue
 
-        # Clamp to valid range
-        f1 = min(max(f1, 0.0), 1.0)
+        # Clamp to valid range (MCC can be -1 to 1, but we treat negative as low)
+        metric_value = min(max(metric_value, -1.0), 1.0)
 
         item = {
             'assembly': assembly,
-            'f1': f1,
+            'f1': stats.get('f1'),
+            'mcc': stats.get('mcc'),
             'precision': stats.get('precision'),
             'recall': stats.get('recall'),
             'gc_content': stats.get('gc_content'),
             'organism': stats.get('organism'),
         }
 
-        if f1 >= high_thresh:
-            categories['high'].append((assembly, f1, item))
-        elif f1 >= low_thresh:
-            categories['medium'].append((assembly, f1, item))
+        if metric_value >= high_thresh:
+            categories['high'].append((assembly, metric_value, item))
+        elif metric_value >= low_thresh:
+            categories['medium'].append((assembly, metric_value, item))
         else:
-            categories['low'].append((assembly, f1, item))
+            categories['low'].append((assembly, metric_value, item))
 
-    # Sort each category by F1 value (descending)
+    # Sort each category by metric value (descending)
     for cat in categories:
         categories[cat].sort(key=lambda x: x[1], reverse=True)
 
@@ -400,13 +406,17 @@ Examples:
         genome_stats = load_genome_stats(args.genome_stats)
         print(f"  Loaded stats for {len(genome_stats)} genomes")
 
-        # Check if we have F1 scores
+        # Check if we have MCC scores (preferred) or F1 scores
+        has_mcc = any(gs.get('mcc') is not None for gs in genome_stats.values())
         has_f1 = any(gs.get('f1') is not None for gs in genome_stats.values())
-        if has_f1:
+        if has_mcc:
+            use_f1 = True  # This flag means "use proper metrics" not just precision
+            print("  Using MCC scores for categorization")
+        elif has_f1:
             use_f1 = True
-            print("  Using F1 scores for categorization")
+            print("  Using F1 scores for categorization (no MCC available)")
         else:
-            print("  Warning: No F1 scores found in genome_stats")
+            print("  Warning: No MCC or F1 scores found in genome_stats")
 
     # Load clustering_results.json for metrics (P/R/F1/MCC)
     if args.clustering_results and Path(args.clustering_results).exists():
@@ -481,13 +491,15 @@ Examples:
     print("\nCategorizing genomes by performance...")
 
     if use_f1 and genome_stats:
-        # Use F1 from genome_stats (preferred)
+        # Use MCC from genome_stats (preferred), fall back to F1
+        has_mcc = any(gs.get('mcc') is not None for gs in genome_stats.values())
         categories = categorize_genomes_from_stats(
             genome_stats,
             high_thresh=args.high_thresh,
-            low_thresh=args.low_thresh
+            low_thresh=args.low_thresh,
+            use_mcc=has_mcc
         )
-        metric_label = "F1"
+        metric_label = "MCC" if has_mcc else "F1"
     else:
         # Use precision from plot_summary.json (fallback)
         categories = categorize_genomes_from_summary(
