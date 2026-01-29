@@ -141,17 +141,23 @@ class SAEModule(torch.nn.Module):
         else:
             raise ValueError(f"Unexpected checkpoint format. Keys: {list(state_dict.keys())}")
 
-        # W shape: (d_sae, d_model) - encoder weights
-        d_sae, d_model = W.shape
-        print(f"  Dimensions: d_model={d_model}, d_sae={d_sae}")
+        # W shape: (d_model, d_sae) - for tied-weight SAE
+        # Encoder: x @ W + b_enc -> (batch, seq, d_sae)
+        # Decoder: acts @ W.T + b_dec -> (batch, seq, d_model)
+        d_model, d_sae = W.shape
+        print(f"  Dimensions: d_model={d_model}, d_sae={d_sae} (expansion={d_sae//d_model}x)")
 
         # Create model
         model = cls(d_model=d_model, d_sae=d_sae)
 
-        # Load weights - this is a tied-weight SAE (W_dec = W_enc.T)
-        model.W_enc.data = W
+        # Load weights - this is a tied-weight SAE
+        # W is (d_model, d_sae), used as: x @ W + b_enc for encoding
+        # For F.linear(x, weight, bias) which computes x @ weight.T + bias:
+        # - W_enc should be (d_sae, d_model) so x @ W_enc.T = x @ W
+        # - W_dec should be (d_model, d_sae) so acts @ W_dec.T = acts @ W.T
+        model.W_enc.data = W.T  # (d_sae, d_model)
         model.b_enc.data = b_enc
-        model.W_dec.data = W.T  # Decoder is transpose of encoder
+        model.W_dec.data = W    # (d_model, d_sae), so F.linear gives acts @ W.T
         model.b_dec.data = b_dec
 
         model.to(device)
