@@ -37,9 +37,40 @@ import numpy as np
 
 
 def load_plot_summary(summary_path):
-    """Load plot summary JSON with performance metrics."""
+    """Load plot summary JSON with performance metrics.
+
+    Auto-detects format: plot_summary.json (flat) vs clustering_results.json (nested).
+    """
     with open(summary_path, 'r') as f:
-        return json.load(f)
+        data = json.load(f)
+
+    # Check if this is clustering_results.json format (has simple_metrics nested)
+    if data and isinstance(data, list) and len(data) > 0:
+        first_entry = data[0]
+        if isinstance(first_entry, dict) and 'simple_metrics' in first_entry:
+            # Convert clustering_results.json format to flat format
+            print("  (Detected clustering_results.json format, extracting metrics)")
+            flat_data = []
+            for entry in data:
+                metrics = entry.get('simple_metrics', {})
+                flat_entry = {
+                    'assembly': entry['assembly'],
+                    'precision': metrics.get('precision'),
+                    'recall': metrics.get('recall'),
+                    'f1': metrics.get('f1'),
+                    'mcc': metrics.get('mcc'),
+                    'gt_regions': entry.get('gt_regions', metrics.get('gt_regions')),
+                }
+                flat_data.append(flat_entry)
+
+            # Debug: show first entry
+            if flat_data:
+                first = flat_data[0]
+                print(f"  Sample metrics - R:{first.get('recall'):.3f} P:{first.get('precision'):.3f} MCC:{first.get('mcc'):.3f}")
+
+            return flat_data
+
+    return data
 
 
 def load_ground_truth_metadata(csv_path):
@@ -178,36 +209,46 @@ def categorize_genomes_from_stats(genome_stats, high_thresh=0.7, low_thresh=0.3)
 
 def categorize_genomes_from_summary(summary_data, genome_stats=None,
                                     high_thresh=0.7, low_thresh=0.3):
-    """Categorize genomes using plot_summary.json. Priority: recall > MCC > F1 > precision."""
+    """Categorize genomes using summary data. Priority: recall > MCC > F1 > precision."""
     categories = {'high': [], 'medium': [], 'low': []}
 
-    # Determine which metric to use from genome_stats (priority: recall > mcc > f1)
-    metric_key = 'precision'  # fallback
-    if genome_stats:
-        has_recall = any(gs.get('recall') is not None for gs in genome_stats.values())
-        has_mcc = any(gs.get('mcc') is not None for gs in genome_stats.values())
-        has_f1 = any(gs.get('f1') is not None for gs in genome_stats.values())
+    # Determine which metric to use (priority: recall > mcc > f1 > precision)
+    # First check summary_data itself (may have metrics from clustering_results.json)
+    has_recall = any(item.get('recall') is not None for item in summary_data)
+    has_mcc = any(item.get('mcc') is not None for item in summary_data)
+    has_f1 = any(item.get('f1') is not None for item in summary_data)
 
-        if has_recall:
-            metric_key = 'recall'
-        elif has_mcc:
-            metric_key = 'mcc'
-        elif has_f1:
-            metric_key = 'f1'
+    # Also check genome_stats if provided
+    if genome_stats:
+        has_recall = has_recall or any(gs.get('recall') is not None for gs in genome_stats.values())
+        has_mcc = has_mcc or any(gs.get('mcc') is not None for gs in genome_stats.values())
+        has_f1 = has_f1 or any(gs.get('f1') is not None for gs in genome_stats.values())
+
+    if has_recall:
+        metric_key = 'recall'
+    elif has_mcc:
+        metric_key = 'mcc'
+    elif has_f1:
+        metric_key = 'f1'
+    else:
+        metric_key = 'precision'
 
     for item in summary_data:
         assembly = item['assembly']
 
-        # Get metric value from genome_stats if available, otherwise use precision from summary
-        if genome_stats and assembly in genome_stats and genome_stats[assembly].get(metric_key) is not None:
-            value = genome_stats[assembly][metric_key]
-        else:
+        # Get metric value - check item first, then genome_stats
+        value = item.get(metric_key)
+        if value is None and genome_stats and assembly in genome_stats:
+            value = genome_stats[assembly].get(metric_key)
+        if value is None:
             value = item.get('precision', 0)
-            metric_key = 'precision'
 
         # Handle edge cases (precision > 1 means calculation error, treat as high)
-        if value > 1.0:
+        if value is not None and value > 1.0:
             value = 1.0
+
+        if value is None:
+            continue
 
         item['metric_used'] = metric_key
         item['metric_value'] = value
@@ -482,6 +523,20 @@ Examples:
         print(f"\nLoading plot summary from {summary_json_path}...")
         summary_data = load_plot_summary(summary_json_path)
         print(f"  Loaded {len(summary_data)} genome entries")
+
+        # Check if summary_data has proper metrics (from clustering_results.json conversion)
+        if summary_data:
+            has_recall_in_summary = any(item.get('recall') is not None for item in summary_data)
+            has_mcc_in_summary = any(item.get('mcc') is not None for item in summary_data)
+            has_f1_in_summary = any(item.get('f1') is not None for item in summary_data)
+            if has_recall_in_summary or has_mcc_in_summary or has_f1_in_summary:
+                use_f1 = True
+                if has_recall_in_summary:
+                    print("  Found RECALL metrics - will use for categorization")
+                elif has_mcc_in_summary:
+                    print("  Found MCC metrics - will use for categorization")
+                else:
+                    print("  Found F1 metrics - will use for categorization")
 
     # Validate we have some data
     if not genome_stats and not summary_data:
