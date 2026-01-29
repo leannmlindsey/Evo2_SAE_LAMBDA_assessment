@@ -365,33 +365,49 @@ class ProphageDetector:
         return activations
     
     def call_prophages(self, activations: np.ndarray, genome_id: str) -> List[Dict]:
-        """Call prophage regions from activation signal."""
+        """Call prophage regions from activation signal.
+
+        Uses a sliding window density approach because the prophage signal
+        is sparse (~1% of positions fire). We look for regions where the
+        DENSITY of firing positions is high, not contiguous regions.
+        """
         threshold = self.config.activation_threshold
         min_length = self.config.min_prophage_length
         merge_dist = self.config.merge_distance
-        
-        # Find regions above threshold
-        above = activations > threshold
-        
-        # Find contiguous regions
+
+        # Calculate density of activations using sliding window
+        window_size = 1000  # 1kb sliding window for density calculation
+        density_threshold = 0.005  # 0.5% of positions in window must be above threshold
+
+        # Binary: positions above threshold
+        above = (activations > threshold).astype(float)
+
+        # Smooth with sliding window to get density
+        kernel = np.ones(window_size) / window_size
+        density = np.convolve(above, kernel, mode='same')
+
+        # Find regions where density exceeds threshold
+        high_density = density > density_threshold
+
+        # Find contiguous high-density regions
         regions = []
         in_region = False
         start = 0
-        
-        for i, is_above in enumerate(above):
-            if is_above and not in_region:
+
+        for i, is_high in enumerate(high_density):
+            if is_high and not in_region:
                 start = i
                 in_region = True
-            elif not is_above and in_region:
+            elif not is_high and in_region:
                 regions.append((start, i))
                 in_region = False
-        
+
         if in_region:
             regions.append((start, len(activations)))
-        
+
         # Filter by minimum length
         regions = [(s, e) for s, e in regions if e - s >= min_length]
-        
+
         # Merge nearby regions
         merged = []
         for region in regions:
@@ -399,10 +415,12 @@ class ProphageDetector:
                 merged[-1] = (merged[-1][0], region[1])
             else:
                 merged.append(region)
-        
+
         # Format output
         predictions = []
         for i, (start, end) in enumerate(merged):
+            # Count positions above threshold in this region
+            n_above = int(above[start:end].sum())
             predictions.append({
                 'genome_id': genome_id,
                 'prophage_id': f"{genome_id}_prophage_{i+1}",
@@ -411,8 +429,10 @@ class ProphageDetector:
                 'length': int(end - start),
                 'mean_activation': float(activations[start:end].mean()),
                 'max_activation': float(activations[start:end].max()),
+                'positions_above_threshold': n_above,
+                'density': n_above / (end - start),
             })
-        
+
         return predictions
     
     def process_genome(self, sequence: str, genome_id: str) -> Tuple[List[Dict], np.ndarray]:
