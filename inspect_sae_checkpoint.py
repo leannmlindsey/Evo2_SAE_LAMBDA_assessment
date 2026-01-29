@@ -15,7 +15,13 @@ from huggingface_hub import list_repo_files, hf_hub_download
 
 def inspect_sae():
     repo_id = "Goodfire/Evo-2-Layer-26-Mixed"
-    sae_dir = Path.home() / "evo2" / "sae_weights"
+    # Use EVO2_BASE_DIR env var if set, otherwise use the script's directory
+    script_dir = Path(__file__).resolve().parent
+    base_dir = Path(os.environ.get("EVO2_BASE_DIR", str(script_dir)))
+    sae_dir = base_dir / "sae_weights"
+
+    print(f"Looking for SAE weights in: {sae_dir}")
+    print(f"(Set EVO2_BASE_DIR env var to override)")
     
     print("=" * 60)
     print("Inspecting Evo2 SAE Checkpoint")
