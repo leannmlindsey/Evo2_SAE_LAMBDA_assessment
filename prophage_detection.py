@@ -4,20 +4,15 @@ Evo2 SAE Prophage Detection Pipeline
 =====================================
 Detect prophages in bacterial genomes using Evo2's SAE feature f/19746.
 
+Based on the official Evo2 SAE notebook from Goodfire/Arc Institute.
+
 Usage:
-    # First, inspect the SAE checkpoint:
-    python inspect_sae_checkpoint.py
-    
-    # Then run detection:
-    python run_prophage_detection.py --genome_dir /path/to/genomes --output_dir ./results
-    
-    # With ground truth evaluation:
-    python run_prophage_detection.py --genome_dir /path/to/genomes --output_dir ./results --ground_truth annotations.bed
+    python prophage_detection.py --genome_dir /path/to/genomes --output_dir ./results
 
 Requirements:
     - Evo2 installed (pip install evo2)
-    - SAE weights downloaded to ~/evo2/sae_weights/
-    - H200/A100 GPU with FP8 support
+    - SAE weights downloaded
+    - H200/A100 GPU
 """
 
 import os
@@ -27,11 +22,18 @@ import argparse
 import numpy as np
 import pandas as pd
 import torch
+from math import prod
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Callable
 from tqdm import tqdm
 from datetime import datetime
+from huggingface_hub import hf_hub_download
+
+from evo2 import Evo2
+
+# Disable gradient computation for inference
+torch.set_grad_enabled(False)
 
 # ============================================================
 # Configuration
@@ -44,130 +46,215 @@ class Config:
     genome_dir: str = ""
     output_dir: str = "./prophage_results"
     ground_truth: Optional[str] = None
-    sae_weights_dir: str = "/home/lindseylm/evo2/sae_weights"
-    
+    sae_weights_path: str = ""  # Will be set from HuggingFace download
+
     # Model
-    model_name: str = "evo2_7b"
-    device: str = "cuda:0"  # Use first GPU by default
-    
+    model_name: str = "evo2_7b"  # Will use evo2_7b (not evo2_7b_262k for compatibility)
+    device: str = "cuda:0"
+
     # SAE settings (from Evo2 paper)
     prophage_feature_idx: int = 19746
-    sae_layer: str = "blocks.26"  # Will be verified by inspect script
-    
+    sae_layer: str = "blocks-26"  # Note: hyphen, not dot (for hook system)
+    d_hidden: int = 4096  # Evo2 hidden dimension at this layer
+    expansion_factor: int = 8  # SAE expansion factor
+
     # Detection parameters
     window_size: int = 8192
     overlap: int = 1024
     activation_threshold: float = 0.5
     min_prophage_length: int = 5000
     merge_distance: int = 2000
-    
+
     # Processing
-    batch_size: int = 1  # Sequences per batch (keep at 1 for variable lengths)
+    batch_size: int = 1
     save_activations: bool = True
 
 
 # ============================================================
-# SAE Module (Update after running inspect_sae_checkpoint.py)
+# ModelScope - Hook management for Evo2 (from official notebook)
 # ============================================================
 
-class SAEModule(torch.nn.Module):
-    """
-    Sparse Autoencoder for Evo2.
+class ModelScope:
+    """Class for adding, using, and removing PyTorch hooks with a model."""
 
-    Based on Goodfire SAE checkpoint inspection:
-    - d_model = 8192 (Evo2 hidden dimension)
-    - d_sae = 65536 (expansion factor = 8)
-    - k = 64 (TopK sparsity)
-    - Keys: W_enc, b_enc, W_dec, b_dec
-    """
+    def __init__(self, model):
+        self.model = model
+        self.hooks = {}
+        self.activations_cache = {}
+        self.override_store = {}
+        self._build_module_dict()
 
-    def __init__(self, d_model: int = 8192, d_sae: int = 65536, k: int = 64):
+    def _build_module_dict(self):
+        """Walks the model's module tree and builds a name: module map."""
+        self._module_dict = {}
+
+        def recurse(module, prefix=''):
+            for name, child in module.named_children():
+                self._module_dict[prefix + name] = child
+                recurse(child, prefix=prefix + name + '-')
+
+        recurse(self.model)
+
+    def list_modules(self):
+        return self._module_dict.keys()
+
+    def add_hook(self, hook_fn, module_str, hook_name):
+        module = self._module_dict[module_str]
+        hook_handle = module.register_forward_hook(hook_fn)
+        self.hooks[hook_name] = hook_handle
+
+    def remove_hook(self, hook_name):
+        self.hooks[hook_name].remove()
+        del self.hooks[hook_name]
+
+    def remove_all_hooks(self):
+        hooks = list(self.hooks.keys())
+        for hook_name in hooks:
+            self.remove_hook(hook_name)
+
+    def clear_all_caches(self):
+        for module_str in self.activations_cache.keys():
+            self.activations_cache[module_str] = []
+
+
+# ============================================================
+# BatchTopKTiedSAE - SAE architecture (from official notebook)
+# ============================================================
+
+class BatchTopKTiedSAE(torch.nn.Module):
+    """Batch TopK Tied-weight Sparse Autoencoder."""
+
+    def __init__(self, d_in, d_hidden, k, device, dtype, tiebreaker_epsilon: float = 1e-6):
         super().__init__()
-        self.d_model = d_model
-        self.d_sae = d_sae
-        self.k = k  # TopK sparsity
+        self.d_in = d_in
+        self.d_hidden = d_hidden
+        self.k = k
 
-        # Weights (will be loaded from checkpoint)
-        self.W_enc = torch.nn.Parameter(torch.zeros(d_sae, d_model))
-        self.b_enc = torch.nn.Parameter(torch.zeros(d_sae))
-        self.W_dec = torch.nn.Parameter(torch.zeros(d_model, d_sae))
-        self.b_dec = torch.nn.Parameter(torch.zeros(d_model))
+        W_mat = torch.randn((d_in, d_hidden))
+        W_mat = 0.1 * W_mat / torch.linalg.norm(W_mat, dim=0, ord=2, keepdim=True)
+        self.W = torch.nn.Parameter(W_mat)
+        self.b_enc = torch.nn.Parameter(torch.zeros(self.d_hidden))
+        self.b_dec = torch.nn.Parameter(torch.zeros(self.d_in))
+        self.device = device
+        self.dtype = dtype
+        self.tiebreaker_epsilon = tiebreaker_epsilon
+        self.tiebreaker = torch.linspace(0, tiebreaker_epsilon, d_hidden)
+        self.to(self.device, self.dtype)
 
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Get sparse feature activations."""
-        # x: (..., d_model) -> pre_acts: (..., d_sae)
-        pre_acts = torch.nn.functional.linear(x, self.W_enc, self.b_enc)
+    def encoder_pre(self, x):
+        return x @ self.W + self.b_enc
 
-        # TopK activation - convert to float32 for topk (bfloat16 not supported)
-        original_dtype = pre_acts.dtype
-        pre_acts_f32 = pre_acts.float()
-        topk_values, topk_indices = torch.topk(pre_acts_f32, self.k, dim=-1)
-        acts = torch.zeros_like(pre_acts_f32)
-        acts.scatter_(-1, topk_indices, torch.relu(topk_values))
+    def encode(self, x, tiebreak=False):
+        f = torch.nn.functional.relu(self.encoder_pre(x))
+        return self._batch_topk(f, self.k, tiebreak=tiebreak)
 
-        return acts.to(original_dtype)
+    def _batch_topk(self, f, k, tiebreak=False):
+        if tiebreak:
+            f = f + self.tiebreaker.to(f.device).broadcast_to(f.shape)
+        *input_shape, _ = f.shape
+        numel = k * prod(input_shape)
 
-    def decode(self, acts: torch.Tensor) -> torch.Tensor:
-        """Reconstruct from sparse activations."""
-        return torch.nn.functional.linear(acts, self.W_dec, self.b_dec)
+        # Convert to float32 for topk operation
+        f_flat = f.flatten().float()
+        f_topk = torch.topk(f_flat, numel, dim=-1)
+        result = torch.zeros_like(f_flat).scatter(-1, f_topk.indices, f_topk.values)
+        return result.reshape(f.shape).to(f.dtype)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward pass returning (reconstruction, activations)."""
-        acts = self.encode(x)
-        recon = self.decode(acts)
-        return recon, acts
+    def decode(self, f):
+        return f @ self.W.T + self.b_dec
 
-    @classmethod
-    def from_pretrained(cls, checkpoint_path: str, device: str = "cuda") -> "SAEModule":
-        """Load pretrained SAE from Goodfire checkpoint.
+    def forward(self, x):
+        f = self.encode(x)
+        return self.decode(f), f
 
-        Checkpoint format:
-        - _orig_mod.W: encoder weights (d_sae, d_model), decoder is transpose
-        - _orig_mod.b_enc: encoder bias (d_sae,)
-        - _orig_mod.b_dec: decoder bias (d_model,)
-        """
-        print(f"Loading SAE from {checkpoint_path}")
 
-        state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
-        print(f"  Checkpoint keys: {list(state_dict.keys())}")
+def load_topk_sae(sae_path: str, d_hidden: int, device: str, dtype: torch.dtype, expansion_factor: int = 8):
+    """Load a TopK SAE from checkpoint."""
+    sae_dict = torch.load(sae_path, weights_only=True, map_location="cpu")
 
-        # Get the weight matrix - handles _orig_mod prefix from torch.compile
-        if '_orig_mod.W' in state_dict:
-            W = state_dict['_orig_mod.W']
-            b_enc = state_dict['_orig_mod.b_enc']
-            b_dec = state_dict['_orig_mod.b_dec']
-        elif 'W' in state_dict:
-            W = state_dict['W']
-            b_enc = state_dict['b_enc']
-            b_dec = state_dict['b_dec']
-        else:
-            raise ValueError(f"Unexpected checkpoint format. Keys: {list(state_dict.keys())}")
+    # Strip _orig_mod. and module. prefixes
+    new_dict = {}
+    for key, item in sae_dict.items():
+        new_dict[key.replace("_orig_mod.", "").replace("module.", "")] = item
+    sae_dict = new_dict
 
-        # W shape: (d_model, d_sae) - for tied-weight SAE
-        # Encoder: x @ W + b_enc -> (batch, seq, d_sae)
-        # Decoder: acts @ W.T + b_dec -> (batch, seq, d_model)
-        d_model, d_sae = W.shape
-        print(f"  Dimensions: d_model={d_model}, d_sae={d_sae} (expansion={d_sae//d_model}x)")
+    cached_sae = BatchTopKTiedSAE(
+        d_hidden,
+        d_hidden * expansion_factor,
+        64,  # TopK 64
+        device,
+        dtype,
+    )
+    cached_sae.load_state_dict(sae_dict)
+    return cached_sae
 
-        # Create model
-        model = cls(d_model=d_model, d_sae=d_sae)
 
-        # Load weights - this is a tied-weight SAE
-        # W is (d_model, d_sae), used as: x @ W + b_enc for encoding
-        # For F.linear(x, weight, bias) which computes x @ weight.T + bias:
-        # - W_enc should be (d_sae, d_model) so x @ W_enc.T = x @ W
-        # - W_dec should be (d_model, d_sae) so acts @ W_dec.T = acts @ W.T
-        model.W_enc.data = W.T  # (d_sae, d_model)
-        model.b_enc.data = b_enc
-        model.W_dec.data = W    # (d_model, d_sae), so F.linear gives acts @ W.T
-        model.b_dec.data = b_dec
+# ============================================================
+# ObservableEvo2 - Evo2 wrapper with hook support (from official notebook)
+# ============================================================
 
-        model.to(device)
-        model.to(torch.bfloat16)  # Match Evo2's dtype
-        model.eval()
+INTERVENTION_INTERFACE = Callable[[torch.Tensor], torch.Tensor]
 
-        print(f"  ✓ SAE loaded successfully (dtype: bfloat16)")
-        return model
+
+class ObservableEvo2:
+    """Evo2 model wrapper with activation caching via hooks."""
+
+    def __init__(self, model_name: str):
+        self.model_name = model_name
+        self.evo_model = Evo2(model_name)
+        self.scope = ModelScope(self.evo_model.model)
+        self.tokenizer = self.evo_model.tokenizer
+        self.model = self.evo_model.model
+        self.d_hidden = 4096
+
+    @property
+    def device(self):
+        return next(self.evo_model.model.parameters()).device
+
+    @property
+    def dtype(self):
+        return self.evo_model.dtype
+
+    def list_modules(self):
+        return self.scope.list_modules()
+
+    def forward(
+        self,
+        toks: torch.Tensor,
+        cache_activations_at: Optional[List[str]] = None,
+        interventions: dict[str, INTERVENTION_INTERFACE] = None,
+    ):
+        if not interventions:
+            interventions = {}
+        if not cache_activations_at:
+            cache_activations_at = []
+
+        output_cache = {}
+        layers = list(set(list(interventions.keys()) + cache_activations_at))
+
+        if layers:
+            for layer in layers:
+                def _intervene(model, input, output, layer=layer):
+                    acts = output[0] if isinstance(output, tuple) else output
+
+                    if layer in interventions:
+                        acts = interventions[layer](acts)
+
+                    if layer in cache_activations_at:
+                        output_cache[layer] = acts.detach()
+
+                    return (acts, output[1]) if isinstance(output, tuple) else acts
+
+                self.scope.add_hook(_intervene, layer, f'intervene-{layer}')
+
+        try:
+            model_outputs = self.model(toks)
+            cached_activations = {layer: act.clone() for layer, act in output_cache.items()}
+        finally:
+            self.scope.remove_all_hooks()
+            self.scope.clear_all_caches()
+
+        return model_outputs[0], cached_activations
 
 
 # ============================================================
@@ -176,139 +263,101 @@ class SAEModule(torch.nn.Module):
 
 class ProphageDetector:
     """Detect prophages using Evo2 SAE features."""
-    
+
     def __init__(self, config: Config):
         self.config = config
-        self.device = torch.device(config.device)
-        
+
         print(f"\n{'='*60}")
         print("Initializing Prophage Detector")
         print(f"{'='*60}")
-        print(f"Device: {self.device}")
         print(f"Model: {config.model_name}")
-        
-        # Load Evo2
+
+        # Load Evo2 with hook support
         print(f"\nLoading Evo2 model...")
-        from evo2 import Evo2
-        self.model = Evo2(config.model_name)
+        self.model = ObservableEvo2(config.model_name)
+        print(f"  Device: {self.model.device}")
+        print(f"  d_hidden: {self.model.d_hidden}")
         print(f"  ✓ Evo2 loaded")
-        
-        # Load SAE
+
+        # Download and load SAE
         print(f"\nLoading SAE...")
-        sae_path = self._find_sae_checkpoint()
-        self.sae = SAEModule.from_pretrained(sae_path, str(self.device))
+        if not config.sae_weights_path:
+            config.sae_weights_path = hf_hub_download(
+                repo_id="Goodfire/Evo-2-Layer-26-Mixed",
+                filename="sae-layer26-mixed-expansion_8-k_64.pt",
+                repo_type="model"
+            )
+        print(f"  SAE path: {config.sae_weights_path}")
+
+        self.sae = load_topk_sae(
+            config.sae_weights_path,
+            d_hidden=self.model.d_hidden,
+            device=self.model.device,
+            dtype=torch.bfloat16,
+            expansion_factor=config.expansion_factor
+        )
+        print(f"  d_in: {self.sae.d_in}, d_hidden: {self.sae.d_hidden}")
         print(f"  ✓ SAE loaded")
-        
+
         # Verify prophage feature exists
         print(f"\nProphage feature index: {config.prophage_feature_idx}")
-        if config.prophage_feature_idx >= self.sae.d_sae:
+        if config.prophage_feature_idx >= self.sae.d_hidden:
             raise ValueError(
-                f"Prophage feature {config.prophage_feature_idx} >= SAE dimension {self.sae.d_sae}"
+                f"Prophage feature {config.prophage_feature_idx} >= SAE dimension {self.sae.d_hidden}"
             )
         print(f"  ✓ Feature index valid")
-        
-    def _find_sae_checkpoint(self) -> str:
-        """Find the SAE checkpoint file."""
-        sae_dir = Path(self.config.sae_weights_dir)
-        
-        # Look for checkpoint files
-        for pattern in ['*.pt', '*.pth', '*.safetensors', '*.bin']:
-            files = list(sae_dir.glob(pattern))
-            if files:
-                # Prefer the largest file (likely the weights)
-                return str(max(files, key=lambda f: f.stat().st_size))
-        
-        # Check subdirectories
-        for pattern in ['**/*.pt', '**/*.safetensors']:
-            files = list(sae_dir.glob(pattern))
-            if files:
-                return str(max(files, key=lambda f: f.stat().st_size))
-        
-        raise FileNotFoundError(f"No checkpoint found in {sae_dir}")
-    
-    def get_embeddings(self, sequence: str) -> torch.Tensor:
-        """Extract embeddings from Evo2 at the SAE layer (block 26)."""
-        # Tokenize
-        input_ids = torch.tensor(
-            self.model.tokenizer.tokenize(sequence),
-            dtype=torch.int,
-        ).unsqueeze(0).to(self.device)
 
-        # Based on inspect_sae_checkpoint.py output:
-        # blocks.26 is a ParallelGatedConvBlock with mlp.l3 as the MLP output
-        # The SAE was trained on layer 26 outputs (d_model=8192)
-        layer_candidates = [
-            "blocks.26.mlp.l3",      # MLP output (most likely)
-            "blocks.26.post_norm",   # After normalization
-            "blocks.26",             # Full block output
-        ]
+    def get_feature_activations(self, sequence: str) -> np.ndarray:
+        """Get SAE feature activations for a sequence."""
+        toks = self.model.tokenizer.tokenize(sequence)
+        toks = torch.tensor(toks, dtype=torch.long).unsqueeze(0).to(self.model.device)
 
-        for layer_name in layer_candidates:
-            try:
-                with torch.no_grad():
-                    outputs, embeddings = self.model(
-                        input_ids,
-                        return_embeddings=True,
-                        layer_names=[layer_name]
-                    )
-                if layer_name in embeddings:
-                    emb = embeddings[layer_name].squeeze(0)
-                    # Verify dimension matches SAE input
-                    if emb.shape[-1] == self.sae.d_model:
-                        return emb
-                    else:
-                        print(f"    Layer {layer_name} has dim {emb.shape[-1]}, expected {self.sae.d_model}")
-                        continue
-            except Exception as e:
-                print(f"    Layer {layer_name} failed: {e}")
-                continue
+        with torch.no_grad():
+            logits, acts = self.model.forward(toks, cache_activations_at=[self.config.sae_layer])
+            feats = self.sae.encode(acts[self.config.sae_layer][0])
 
-        raise RuntimeError(f"Could not extract embeddings with d_model={self.sae.d_model}. Tried: {layer_candidates}")
-    
+        return feats.cpu().detach().float().numpy()
+
     def get_prophage_activations(self, sequence: str) -> np.ndarray:
         """Get prophage feature activations across a sequence."""
         seq_len = len(sequence)
         window_size = self.config.window_size
         overlap = self.config.overlap
-        
+
         # Initialize
         activations = np.zeros(seq_len)
         counts = np.zeros(seq_len)
-        
+
         # Process in windows
         positions = list(range(0, seq_len, window_size - overlap))
-        
+
         for start in tqdm(positions, desc="  Processing windows", leave=False):
             end = min(start + window_size, seq_len)
             window_seq = sequence[start:end]
-            
+
             if len(window_seq) < 100:
                 continue
-            
+
             try:
-                # Get Evo2 embeddings
-                embeddings = self.get_embeddings(window_seq)
-                
-                # Get SAE activations
-                with torch.no_grad():
-                    _, sae_acts = self.sae(embeddings)
-                
-                # Extract prophage feature
-                prophage_acts = sae_acts[:, self.config.prophage_feature_idx].cpu().numpy()
-                
-                # Handle length mismatch (tokenization may differ)
+                # Get all SAE feature activations for this window
+                all_features = self.get_feature_activations(window_seq)
+
+                # Extract prophage feature (shape: [seq_len, n_features])
+                prophage_acts = all_features[:, self.config.prophage_feature_idx]
+
+                # Handle length mismatch (tokenization may differ from bp)
                 actual_len = min(len(prophage_acts), end - start)
                 activations[start:start+actual_len] += prophage_acts[:actual_len]
                 counts[start:start+actual_len] += 1
-                
+
             except Exception as e:
                 print(f"    Warning: Error at position {start}: {e}")
                 continue
-        
+
         # Average overlapping regions
         counts[counts == 0] = 1
         activations = activations / counts
-        
+
         return activations
     
     def call_prophages(self, activations: np.ndarray, genome_id: str) -> List[Dict]:
@@ -551,18 +600,14 @@ Examples:
     parser.add_argument("--ground_truth", type=str, default=None,
                         help="Ground truth BED file for evaluation")
     parser.add_argument("--model", type=str, default="evo2_7b",
-                        choices=["evo2_7b", "evo2_40b"],
+                        choices=["evo2_7b", "evo2_40b", "evo2_7b_262k"],
                         help="Evo2 model to use")
-    parser.add_argument("--device", type=str, default="cuda:0",
-                        help="Device to use (e.g., cuda:0, cuda:1)")
     parser.add_argument("--threshold", type=float, default=0.5,
                         help="Activation threshold for prophage calls")
     parser.add_argument("--min_length", type=int, default=5000,
                         help="Minimum prophage length (bp)")
     parser.add_argument("--save_activations", action="store_true",
                         help="Save raw activation arrays")
-    parser.add_argument("--sae_weights_dir", type=str, default="/home/lindseylm/evo2/sae_weights",
-                        help="Directory containing SAE weights")
 
     args = parser.parse_args()
 
@@ -572,21 +617,15 @@ Examples:
         output_dir=args.output_dir,
         ground_truth=args.ground_truth,
         model_name=args.model,
-        device=args.device,
         activation_threshold=args.threshold,
         min_prophage_length=args.min_length,
         save_activations=args.save_activations,
-        sae_weights_dir=args.sae_weights_dir,
     )
-    
+
     # Create output directory
     output_dir = Path(config.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Save config
-    with open(output_dir / "config.json", 'w') as f:
-        json.dump(vars(config), f, indent=2)
-    
+
     print(f"\n{'='*60}")
     print("Evo2 SAE Prophage Detection")
     print(f"{'='*60}")
@@ -594,12 +633,15 @@ Examples:
     print(f"Genome directory: {config.genome_dir}")
     print(f"Output directory: {config.output_dir}")
     print(f"Model: {config.model_name}")
-    print(f"Device: {config.device}")
     print(f"Threshold: {config.activation_threshold}")
-    
+
     # Initialize detector
     detector = ProphageDetector(config)
-    
+
+    # Save config (after detector init so SAE path is populated)
+    with open(output_dir / "config.json", 'w') as f:
+        json.dump(vars(config), f, indent=2)
+
     # Find genome files
     genome_dir = Path(config.genome_dir)
     genome_files = (
