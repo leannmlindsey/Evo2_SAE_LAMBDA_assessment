@@ -58,17 +58,17 @@ def get_assembly_from_filename(filename):
 
 def cluster_mws(activations, window=85, threshold=0.4, min_region_size=1000, merge_distance=3000):
     """
-    Moving Window Sum (MWS) algorithm from Phoenix dashboard.
+    Moving Window Sum (MWS) algorithm.
 
-    1. Apply rolling window sum normalized by window size (equivalent to rolling mean)
+    1. Apply centered rolling window SUM (looks forward and backward)
     2. Threshold to get binary predictions
     3. Find contiguous regions
     4. Filter by min size and merge nearby regions
 
     Args:
         activations: Raw activation values per nucleotide
-        window: Rolling window size (default 85 from Phoenix)
-        threshold: Threshold for binary classification (default 0.4 from Phoenix)
+        window: Rolling window size (centered, so looks window//2 in each direction)
+        threshold: Threshold for rolling sum (higher values since not normalized)
         min_region_size: Minimum region size in bp
         merge_distance: Merge regions within this distance
 
@@ -77,9 +77,10 @@ def cluster_mws(activations, window=85, threshold=0.4, min_region_size=1000, mer
     """
     import pandas as pd
 
-    # Step 1: Rolling window sum normalized by window size
+    # Step 1: Centered rolling window SUM (not normalized)
+    # center=True means it looks window//2 positions forward and backward
     df = pd.DataFrame({'act': activations})
-    df['smoothed'] = df['act'].rolling(window=window, center=True, min_periods=1).sum() / window
+    df['smoothed'] = df['act'].rolling(window=window, center=True, min_periods=1).sum()
     df['smoothed'] = df['smoothed'].fillna(0)
 
     # Step 2: Threshold to binary
