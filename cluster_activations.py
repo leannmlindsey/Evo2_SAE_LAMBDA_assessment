@@ -680,7 +680,9 @@ def main():
                 f.write("# assembly\tF1\tprecision\trecall\tMCC\tgt_regions\tpred_regions\n")
                 for r in sorted(bin_data, key=lambda x: -x['simple_metrics']['f1']):
                     m = r['simple_metrics']
-                    f.write(f"{r['assembly']}\t{m['f1']:.3f}\t{m['precision']:.3f}\t{m['recall']:.3f}\t{m['mcc']:.3f}\t{m['gt_total']}\t{m['pred_total']}\n")
+                    gt_total = m.get('gt_total', r.get('gt_regions', 0))
+                    pred_total = m.get('pred_total', len(r.get('simple_regions', [])))
+                    f.write(f"{r['assembly']}\t{m['f1']:.3f}\t{m['precision']:.3f}\t{m['recall']:.3f}\t{m['mcc']:.3f}\t{gt_total}\t{pred_total}\n")
             print(f"\nSaved {bin_name} accuracy list to: {bin_file}")
 
     print(f"\nResults saved to: {output_dir}")
