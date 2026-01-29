@@ -214,38 +214,35 @@ if __name__ == "__main__":
 
     # Load E. coli and test
     print("\n" + "="*60)
-    print("Testing with E. coli genome segment...")
+    print("Testing with E. coli genome segments...")
     try:
         with open('./genomes/ecoli_k12.fna', 'r') as f:
             lines = f.readlines()
             ecoli_seq = ''.join(line.strip() for line in lines if not line.startswith('>'))
 
-        # Test 100kb region from 4.13-4.23 Mb (like notebook demo)
-        start, end = 4130000, 4140000  # 10kb chunk
-        test_seq = ecoli_seq[start:end]
-        print(f"  Testing {start}-{end} bp ({len(test_seq)} bp)")
+        # Test known prophage regions in E. coli K-12 MG1655
+        prophage_regions = [
+            ("e14 prophage", 1195000, 1220000),      # e14 at ~1.19-1.22 Mb
+            ("Rac prophage", 1410000, 1435000),      # Rac at ~1.41-1.43 Mb
+            ("DLP12 prophage", 560000, 585000),      # DLP12 at ~0.56-0.58 Mb
+            ("Non-prophage control", 500000, 525000), # Control region
+            ("Qin prophage", 1630000, 1655000),      # Qin at ~1.63-1.65 Mb
+        ]
 
-        feature_ts = get_feature_ts(model, topk_sae, test_seq)
-        print(f"  Feature activations shape: {feature_ts.shape}")
-        print(f"  Activation stats:")
-        print(f"    min: {feature_ts.min():.4f}")
-        print(f"    max: {feature_ts.max():.4f}")
-        print(f"    mean: {feature_ts.mean():.4f}")
-        print(f"    non-zero: {(feature_ts != 0).sum()} / {feature_ts.size}")
+        for name, start, end in prophage_regions:
+            test_seq = ecoli_seq[start:end]
+            print(f"\n  Testing {name}: {start:,}-{end:,} bp ({len(test_seq):,} bp)")
 
-        # Check prophage feature
-        print(f"\n  Feature 19746 (prophage):")
-        feat_19746 = feature_ts[:, 19746]
-        print(f"    max: {feat_19746.max():.4f}")
-        print(f"    mean: {feat_19746.mean():.4f}")
-        print(f"    non-zero positions: {sum(feat_19746 > 0)}")
+            feature_ts = get_feature_ts(model, topk_sae, test_seq)
 
-        # Check features from E. coli demo in notebook
-        ecoli_features = [13606, 26069, 30262, 2812, 15680, 11734, 24568, 15481]
-        print(f"\n  E. coli demo features (from notebook):")
-        for feat_idx in ecoli_features:
-            feat_acts = feature_ts[:, feat_idx]
-            print(f"    Feature {feat_idx}: max={feat_acts.max():.4f}, non-zero={sum(feat_acts > 0)}")
+            # Check prophage feature
+            feat_19746 = feature_ts[:, 19746]
+            print(f"    Feature 19746 (prophage):")
+            print(f"      max: {feat_19746.max():.4f}")
+            print(f"      mean: {feat_19746.mean():.6f}")
+            print(f"      non-zero positions: {sum(feat_19746 > 0)} / {len(feat_19746)}")
+            print(f"      positions > 0.5: {sum(feat_19746 > 0.5)}")
+            print(f"      positions > 0.1: {sum(feat_19746 > 0.1)}")
 
     except FileNotFoundError:
         print("  E. coli genome not found at ./genomes/ecoli_k12.fna")
