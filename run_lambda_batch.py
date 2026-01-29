@@ -224,8 +224,13 @@ def get_assembly_id(fasta_filename):
 # Processing
 # ============================================================
 
-def process_genome(model, sae, fasta_path, gt_regions, output_dir, window_size=50000):
-    """Process a single genome and return results."""
+def process_genome(model, sae, fasta_path, gt_regions, output_dir, window_size=50000, startup_trim=10):
+    """Process a single genome and return results.
+
+    Args:
+        startup_trim: Number of positions to discard at start of each window
+                     to avoid model startup artifacts (default: 10)
+    """
 
     assembly_id = get_assembly_id(fasta_path)
     results = {
@@ -252,7 +257,7 @@ def process_genome(model, sae, fasta_path, gt_regions, output_dir, window_size=5
     all_acts = np.zeros(len(full_seq))
 
     positions = list(range(0, len(full_seq), window_size - overlap))
-    for win_start in tqdm(positions, desc=f"  {assembly_id}", leave=False):
+    for win_idx, win_start in enumerate(tqdm(positions, desc=f"  {assembly_id}", leave=False)):
         win_end = min(win_start + window_size, len(full_seq))
         win_seq = full_seq[win_start:win_end]
         if len(win_seq) < 100:
@@ -260,6 +265,12 @@ def process_genome(model, sae, fasta_path, gt_regions, output_dir, window_size=5
         try:
             win_feats = get_feature_ts(model, sae, win_seq)
             win_acts = win_feats[:, PROPHAGE_FEATURE]
+
+            # Trim startup artifact (first N positions have artificially high activations)
+            # For the first window, keep all positions; for subsequent windows, trim startup
+            if win_idx > 0 and startup_trim > 0:
+                win_acts[:startup_trim] = 0.0
+
             actual_len = min(len(win_acts), win_end - win_start)
             all_acts[win_start:win_start+actual_len] = np.maximum(
                 all_acts[win_start:win_start+actual_len],
@@ -319,6 +330,7 @@ def main():
     parser.add_argument("--output_dir", type=str, default="./lambda_results", help="Output directory")
     parser.add_argument("--model", type=str, default="evo2_7b", help="Model name (evo2_7b or evo2_40b)")
     parser.add_argument("--window_size", type=int, default=50000, help="Window size for processing")
+    parser.add_argument("--startup_trim", type=int, default=10, help="Positions to trim from window start to remove artifacts")
     args = parser.parse_args()
 
     output_dir = Path(args.output_dir)
@@ -376,7 +388,7 @@ def main():
                     gt_regions = regions
                     break
 
-        results = process_genome(model, sae, fasta_path, gt_regions, output_dir, args.window_size)
+        results = process_genome(model, sae, fasta_path, gt_regions, output_dir, args.window_size, args.startup_trim)
         all_results.append(results)
 
         # Print progress
