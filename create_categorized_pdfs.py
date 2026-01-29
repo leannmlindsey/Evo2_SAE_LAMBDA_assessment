@@ -125,16 +125,26 @@ def calculate_gc_from_fasta(fasta_path):
     return gc_count / len(sequence)
 
 
-def categorize_genomes_from_stats(genome_stats, high_thresh=0.7, low_thresh=0.3, use_mcc=True):
-    """Categorize genomes using genome_stats.csv (preferred method with MCC scores)."""
+def categorize_genomes_from_stats(genome_stats, high_thresh=0.7, low_thresh=0.3):
+    """Categorize genomes using genome_stats. Priority: recall > MCC > F1 > precision."""
     categories = {'high': [], 'medium': [], 'low': []}
 
+    # Determine which metric to use (priority: recall > mcc > f1 > precision)
+    has_recall = any(gs.get('recall') is not None for gs in genome_stats.values())
+    has_mcc = any(gs.get('mcc') is not None for gs in genome_stats.values())
+    has_f1 = any(gs.get('f1') is not None for gs in genome_stats.values())
+
+    if has_recall:
+        metric_key = 'recall'
+    elif has_mcc:
+        metric_key = 'mcc'
+    elif has_f1:
+        metric_key = 'f1'
+    else:
+        metric_key = 'precision'
+
     for assembly, stats in genome_stats.items():
-        # Prefer MCC for categorization, fall back to F1
-        if use_mcc and stats.get('mcc') is not None:
-            metric_value = stats.get('mcc')
-        else:
-            metric_value = stats.get('f1')
+        metric_value = stats.get(metric_key)
 
         if metric_value is None:
             continue
@@ -163,30 +173,43 @@ def categorize_genomes_from_stats(genome_stats, high_thresh=0.7, low_thresh=0.3,
     for cat in categories:
         categories[cat].sort(key=lambda x: x[1], reverse=True)
 
-    return categories
+    return categories, metric_key
 
 
 def categorize_genomes_from_summary(summary_data, genome_stats=None,
                                     high_thresh=0.7, low_thresh=0.3):
-    """Categorize genomes using plot_summary.json (fallback with precision)."""
+    """Categorize genomes using plot_summary.json. Priority: recall > MCC > F1 > precision."""
     categories = {'high': [], 'medium': [], 'low': []}
+
+    # Determine which metric to use from genome_stats (priority: recall > mcc > f1)
+    metric_key = 'precision'  # fallback
+    if genome_stats:
+        has_recall = any(gs.get('recall') is not None for gs in genome_stats.values())
+        has_mcc = any(gs.get('mcc') is not None for gs in genome_stats.values())
+        has_f1 = any(gs.get('f1') is not None for gs in genome_stats.values())
+
+        if has_recall:
+            metric_key = 'recall'
+        elif has_mcc:
+            metric_key = 'mcc'
+        elif has_f1:
+            metric_key = 'f1'
 
     for item in summary_data:
         assembly = item['assembly']
 
-        # Get metric value - prefer F1 from genome_stats if available
-        if genome_stats and assembly in genome_stats and genome_stats[assembly].get('f1') is not None:
-            value = genome_stats[assembly]['f1']
-            metric_name = 'f1'
+        # Get metric value from genome_stats if available, otherwise use precision from summary
+        if genome_stats and assembly in genome_stats and genome_stats[assembly].get(metric_key) is not None:
+            value = genome_stats[assembly][metric_key]
         else:
             value = item.get('precision', 0)
-            metric_name = 'precision'
+            metric_key = 'precision'
 
         # Handle edge cases (precision > 1 means calculation error, treat as high)
         if value > 1.0:
             value = 1.0
 
-        item['metric_used'] = metric_name
+        item['metric_used'] = metric_key
         item['metric_value'] = value
 
         if value >= high_thresh:
@@ -200,7 +223,7 @@ def categorize_genomes_from_summary(summary_data, genome_stats=None,
     for cat in categories:
         categories[cat].sort(key=lambda x: x[1], reverse=True)
 
-    return categories
+    return categories, metric_key
 
 
 def create_annotated_plot(plot_path, assembly, metric_value, taxonomy, gc_content,
@@ -406,17 +429,21 @@ Examples:
         genome_stats = load_genome_stats(args.genome_stats)
         print(f"  Loaded stats for {len(genome_stats)} genomes")
 
-        # Check if we have MCC scores (preferred) or F1 scores
+        # Check which metrics are available (priority: recall > mcc > f1)
+        has_recall = any(gs.get('recall') is not None for gs in genome_stats.values())
         has_mcc = any(gs.get('mcc') is not None for gs in genome_stats.values())
         has_f1 = any(gs.get('f1') is not None for gs in genome_stats.values())
-        if has_mcc:
+        if has_recall:
             use_f1 = True  # This flag means "use proper metrics" not just precision
-            print("  Using MCC scores for categorization")
+            print("  Will use RECALL for categorization (priority metric)")
+        elif has_mcc:
+            use_f1 = True
+            print("  Will use MCC for categorization (no recall available)")
         elif has_f1:
             use_f1 = True
-            print("  Using F1 scores for categorization (no MCC available)")
+            print("  Will use F1 for categorization (no recall/MCC available)")
         else:
-            print("  Warning: No MCC or F1 scores found in genome_stats")
+            print("  Warning: No recall/MCC/F1 scores found in genome_stats")
 
     # Load clustering_results.json for metrics (P/R/F1/MCC)
     if args.clustering_results and Path(args.clustering_results).exists():
@@ -436,9 +463,11 @@ Examples:
                 if metrics.get(key) is not None and genome_stats[assembly].get(key) is None:
                     genome_stats[assembly][key] = metrics[key]
 
-        # Re-check for F1
+        # Re-check for metrics
+        has_recall = any(gs.get('recall') is not None for gs in genome_stats.values())
+        has_mcc = any(gs.get('mcc') is not None for gs in genome_stats.values())
         has_f1 = any(gs.get('f1') is not None for gs in genome_stats.values())
-        if has_f1:
+        if has_recall or has_mcc or has_f1:
             use_f1 = True
 
     # Load plot_summary.json as fallback or for assembly list
@@ -491,25 +520,24 @@ Examples:
     print("\nCategorizing genomes by performance...")
 
     if use_f1 and genome_stats:
-        # Use MCC from genome_stats (preferred), fall back to F1
-        has_mcc = any(gs.get('mcc') is not None for gs in genome_stats.values())
-        categories = categorize_genomes_from_stats(
+        # Use genome_stats (priority: recall > mcc > f1 > precision)
+        categories, metric_label = categorize_genomes_from_stats(
             genome_stats,
             high_thresh=args.high_thresh,
-            low_thresh=args.low_thresh,
-            use_mcc=has_mcc
+            low_thresh=args.low_thresh
         )
-        metric_label = "MCC" if has_mcc else "F1"
+        metric_label = metric_label.upper()
     else:
-        # Use precision from plot_summary.json (fallback)
-        categories = categorize_genomes_from_summary(
+        # Use plot_summary.json with genome_stats overlay if available
+        categories, metric_key = categorize_genomes_from_summary(
             summary_data,
             genome_stats=genome_stats,
             high_thresh=args.high_thresh,
             low_thresh=args.low_thresh
         )
-        metric_label = "Precision"
-        print(f"  Note: Using {metric_label} for categorization (no F1 scores available)")
+        metric_label = metric_key.upper()
+        if metric_key == 'precision':
+            print(f"  Note: Using {metric_label} for categorization (no recall/MCC/F1 available)")
 
     print(f"  High ({metric_label} >= {args.high_thresh}): {len(categories['high'])} genomes")
     print(f"  Medium ({args.low_thresh} <= {metric_label} < {args.high_thresh}): {len(categories['medium'])} genomes")
