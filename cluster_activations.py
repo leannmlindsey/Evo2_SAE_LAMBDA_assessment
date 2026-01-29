@@ -223,24 +223,27 @@ def filter_by_size(regions, min_size=1000):
 
 def calculate_metrics(predicted_regions, gt_regions, seq_len):
     """
-    Calculate precision, recall, F1 for predicted vs ground truth regions.
+    Calculate precision, recall, F1, and MCC for predicted vs ground truth regions.
 
-    Uses overlap-based matching:
-    - A predicted region is a true positive if it overlaps any GT region by >= 50%
-    - Precision = TP / predicted
-    - Recall = GT regions with any overlap / total GT
+    Uses both region-based and base-pair-level metrics:
+    - Region-based: overlap matching for precision/recall
+    - Base-pair level: MCC calculated on per-position predictions
     """
     if not predicted_regions and not gt_regions:
-        return {'precision': 1.0, 'recall': 1.0, 'f1': 1.0, 'tp': 0, 'fp': 0, 'fn': 0}
+        return {'precision': 1.0, 'recall': 1.0, 'f1': 1.0, 'mcc': 1.0, 'tp': 0, 'fp': 0, 'fn': 0, 'tn': seq_len}
 
     if not predicted_regions:
-        return {'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'tp': 0, 'fp': 0, 'fn': len(gt_regions)}
+        # Calculate TN (positions not in GT)
+        gt_bp = sum(gt['end'] - gt['start'] for gt in gt_regions)
+        tn = seq_len - gt_bp
+        return {'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'mcc': 0.0, 'tp': 0, 'fp': 0, 'fn': len(gt_regions), 'tn': tn}
 
     if not gt_regions:
-        return {'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'tp': 0, 'fp': len(predicted_regions), 'fn': 0}
+        return {'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'mcc': 0.0, 'tp': 0, 'fp': len(predicted_regions), 'fn': 0, 'tn': 0}
 
+    # Region-based metrics
     # Check each predicted region for overlap with GT
-    tp = 0
+    tp_regions = 0
     for pred_start, pred_end in predicted_regions:
         pred_len = pred_end - pred_start
         for gt in gt_regions:
@@ -251,10 +254,10 @@ def calculate_metrics(predicted_regions, gt_regions, seq_len):
 
             # Consider it a TP if overlap >= 50% of predicted region
             if overlap >= 0.5 * pred_len:
-                tp += 1
+                tp_regions += 1
                 break
 
-    fp = len(predicted_regions) - tp
+    fp_regions = len(predicted_regions) - tp_regions
 
     # Check recall: how many GT regions have any overlap with predictions
     gt_found = 0
@@ -267,22 +270,52 @@ def calculate_metrics(predicted_regions, gt_regions, seq_len):
                 gt_found += 1
                 break
 
-    fn = len(gt_regions) - gt_found
+    fn_regions = len(gt_regions) - gt_found
 
-    precision = tp / len(predicted_regions) if predicted_regions else 0
+    precision = tp_regions / len(predicted_regions) if predicted_regions else 0
     recall = gt_found / len(gt_regions) if gt_regions else 0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+
+    # Base-pair level MCC calculation
+    # Create binary arrays for predicted and ground truth
+    pred_mask = np.zeros(seq_len, dtype=bool)
+    gt_mask = np.zeros(seq_len, dtype=bool)
+
+    for start, end in predicted_regions:
+        pred_mask[start:min(end, seq_len)] = True
+
+    for gt in gt_regions:
+        start, end = gt['start'], gt['end']
+        gt_mask[start:min(end, seq_len)] = True
+
+    # Calculate TP, FP, FN, TN at base-pair level
+    tp_bp = np.sum(pred_mask & gt_mask)
+    fp_bp = np.sum(pred_mask & ~gt_mask)
+    fn_bp = np.sum(~pred_mask & gt_mask)
+    tn_bp = np.sum(~pred_mask & ~gt_mask)
+
+    # MCC = (TP*TN - FP*FN) / sqrt((TP+FP)(TP+FN)(TN+FP)(TN+FN))
+    numerator = (tp_bp * tn_bp) - (fp_bp * fn_bp)
+    denominator = np.sqrt(
+        (tp_bp + fp_bp) * (tp_bp + fn_bp) * (tn_bp + fp_bp) * (tn_bp + fn_bp)
+    )
+    mcc = numerator / denominator if denominator > 0 else 0.0
 
     return {
         'precision': precision,
         'recall': recall,
         'f1': f1,
-        'tp': tp,
-        'fp': fp,
-        'fn': fn,
+        'mcc': float(mcc),
+        'tp': tp_regions,
+        'fp': fp_regions,
+        'fn': fn_regions,
         'gt_found': gt_found,
         'gt_total': len(gt_regions),
         'pred_total': len(predicted_regions),
+        'tp_bp': int(tp_bp),
+        'fp_bp': int(fp_bp),
+        'fn_bp': int(fn_bp),
+        'tn_bp': int(tn_bp),
     }
 
 
@@ -570,27 +603,33 @@ def main():
         simple_precision = np.mean([r['simple_metrics']['precision'] for r in genomes_with_gt])
         simple_recall = np.mean([r['simple_metrics']['recall'] for r in genomes_with_gt])
         simple_f1 = np.mean([r['simple_metrics']['f1'] for r in genomes_with_gt])
+        simple_mcc = np.mean([r['simple_metrics']['mcc'] for r in genomes_with_gt])
         print(f"  Precision: {simple_precision:.1%}")
         print(f"  Recall:    {simple_recall:.1%}")
         print(f"  F1:        {simple_f1:.1%}")
+        print(f"  MCC:       {simple_mcc:.3f}")
 
         if args.use_hdbscan:
             print("\nHDBSCAN Performance:")
             hdb_precision = np.mean([r['hdbscan_metrics'].get('precision', 0) for r in genomes_with_gt])
             hdb_recall = np.mean([r['hdbscan_metrics'].get('recall', 0) for r in genomes_with_gt])
             hdb_f1 = np.mean([r['hdbscan_metrics'].get('f1', 0) for r in genomes_with_gt])
+            hdb_mcc = np.mean([r['hdbscan_metrics'].get('mcc', 0) for r in genomes_with_gt])
             print(f"  Precision: {hdb_precision:.1%}")
             print(f"  Recall:    {hdb_recall:.1%}")
             print(f"  F1:        {hdb_f1:.1%}")
+            print(f"  MCC:       {hdb_mcc:.3f}")
 
         if args.use_optics:
             print("\nOPTICS Performance:")
             opt_precision = np.mean([r['optics_metrics'].get('precision', 0) for r in genomes_with_gt])
             opt_recall = np.mean([r['optics_metrics'].get('recall', 0) for r in genomes_with_gt])
             opt_f1 = np.mean([r['optics_metrics'].get('f1', 0) for r in genomes_with_gt])
+            opt_mcc = np.mean([r['optics_metrics'].get('mcc', 0) for r in genomes_with_gt])
             print(f"  Precision: {opt_precision:.1%}")
             print(f"  Recall:    {opt_recall:.1%}")
             print(f"  F1:        {opt_f1:.1%}")
+            print(f"  MCC:       {opt_mcc:.3f}")
 
         # Count total regions
         total_simple = sum(len(r['simple_regions']) for r in all_results)
