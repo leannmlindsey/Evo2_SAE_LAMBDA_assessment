@@ -161,9 +161,10 @@ class SAEModule(torch.nn.Module):
         model.b_dec.data = b_dec
 
         model.to(device)
+        model.to(torch.bfloat16)  # Match Evo2's dtype
         model.eval()
 
-        print(f"  ✓ SAE loaded successfully")
+        print(f"  ✓ SAE loaded successfully (dtype: bfloat16)")
         return model
 
 
