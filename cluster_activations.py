@@ -223,61 +223,15 @@ def filter_by_size(regions, min_size=1000):
 
 def calculate_metrics(predicted_regions, gt_regions, seq_len):
     """
-    Calculate precision, recall, F1, and MCC for predicted vs ground truth regions.
+    Calculate precision, recall, F1, MCC, and Jaccard at NUCLEOTIDE level.
 
-    Uses both region-based and base-pair-level metrics:
-    - Region-based: overlap matching for precision/recall
-    - Base-pair level: MCC calculated on per-position predictions
+    All metrics use the same TP/FP/FN/TN counts:
+    - TP = nucleotides correctly predicted as prophage
+    - FP = nucleotides incorrectly predicted as prophage
+    - FN = prophage nucleotides missed
+    - TN = non-prophage nucleotides correctly not predicted
     """
-    if not predicted_regions and not gt_regions:
-        return {'precision': 1.0, 'recall': 1.0, 'f1': 1.0, 'mcc': 1.0, 'tp': 0, 'fp': 0, 'fn': 0, 'tn': seq_len}
-
-    if not predicted_regions:
-        # Calculate TN (positions not in GT)
-        gt_bp = sum(gt['end'] - gt['start'] for gt in gt_regions)
-        tn = seq_len - gt_bp
-        return {'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'mcc': 0.0, 'tp': 0, 'fp': 0, 'fn': len(gt_regions), 'tn': tn}
-
-    if not gt_regions:
-        return {'precision': 0.0, 'recall': 0.0, 'f1': 0.0, 'mcc': 0.0, 'tp': 0, 'fp': len(predicted_regions), 'fn': 0, 'tn': 0}
-
-    # Region-based metrics
-    # Check each predicted region for overlap with GT
-    tp_regions = 0
-    for pred_start, pred_end in predicted_regions:
-        pred_len = pred_end - pred_start
-        for gt in gt_regions:
-            gt_start, gt_end = gt['start'], gt['end']
-            overlap_start = max(pred_start, gt_start)
-            overlap_end = min(pred_end, gt_end)
-            overlap = max(0, overlap_end - overlap_start)
-
-            # Consider it a TP if overlap >= 50% of predicted region
-            if overlap >= 0.5 * pred_len:
-                tp_regions += 1
-                break
-
-    fp_regions = len(predicted_regions) - tp_regions
-
-    # Check recall: how many GT regions have any overlap with predictions
-    gt_found = 0
-    for gt in gt_regions:
-        gt_start, gt_end = gt['start'], gt['end']
-        for pred_start, pred_end in predicted_regions:
-            overlap_start = max(pred_start, gt_start)
-            overlap_end = min(pred_end, gt_end)
-            if overlap_end > overlap_start:
-                gt_found += 1
-                break
-
-    fn_regions = len(gt_regions) - gt_found
-
-    precision = tp_regions / len(predicted_regions) if predicted_regions else 0
-    recall = gt_found / len(gt_regions) if gt_regions else 0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-
-    # Base-pair level MCC calculation
-    # Create binary arrays for predicted and ground truth
+    # Create binary masks for predicted and ground truth
     pred_mask = np.zeros(seq_len, dtype=bool)
     gt_mask = np.zeros(seq_len, dtype=bool)
 
@@ -288,42 +242,50 @@ def calculate_metrics(predicted_regions, gt_regions, seq_len):
         start, end = gt['start'], gt['end']
         gt_mask[start:min(end, seq_len)] = True
 
-    # Calculate TP, FP, FN, TN at base-pair level
-    tp_bp = np.sum(pred_mask & gt_mask)
-    fp_bp = np.sum(pred_mask & ~gt_mask)
-    fn_bp = np.sum(~pred_mask & gt_mask)
-    tn_bp = np.sum(~pred_mask & ~gt_mask)
+    # Calculate TP, FP, FN, TN at nucleotide level
+    tp = np.sum(pred_mask & gt_mask)
+    fp = np.sum(pred_mask & ~gt_mask)
+    fn = np.sum(~pred_mask & gt_mask)
+    tn = np.sum(~pred_mask & ~gt_mask)
+
+    # Convert to float64 to avoid overflow
+    tp = np.float64(tp)
+    fp = np.float64(fp)
+    fn = np.float64(fn)
+    tn = np.float64(tn)
+
+    # Precision = TP / (TP + FP)
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+
+    # Recall = TP / (TP + FN)
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+
+    # F1 = 2 * P * R / (P + R)
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0.0
+
+    # Jaccard (IoU) = TP / (TP + FP + FN)
+    jaccard = tp / (tp + fp + fn) if (tp + fp + fn) > 0 else 0.0
 
     # MCC = (TP*TN - FP*FN) / sqrt((TP+FP)(TP+FN)(TN+FP)(TN+FN))
-    # Use sqrt of products to avoid overflow: sqrt(a*b*c*d) = sqrt(a*b) * sqrt(c*d)
-    tp_bp = np.float64(tp_bp)
-    fp_bp = np.float64(fp_bp)
-    fn_bp = np.float64(fn_bp)
-    tn_bp = np.float64(tn_bp)
-
-    numerator = (tp_bp * tn_bp) - (fp_bp * fn_bp)
-    # Split sqrt to avoid overflow: sqrt(a*b*c*d) = sqrt(a*b) * sqrt(c*d)
-    denom_part1 = np.sqrt((tp_bp + fp_bp) * (tp_bp + fn_bp))
-    denom_part2 = np.sqrt((tn_bp + fp_bp) * (tn_bp + fn_bp))
+    numerator = (tp * tn) - (fp * fn)
+    # Split sqrt to avoid overflow
+    denom_part1 = np.sqrt((tp + fp) * (tp + fn))
+    denom_part2 = np.sqrt((tn + fp) * (tn + fn))
     denominator = denom_part1 * denom_part2
-
     mcc = numerator / denominator if denominator > 0 else 0.0
 
     return {
-        'precision': precision,
-        'recall': recall,
-        'f1': f1,
+        'precision': float(precision),
+        'recall': float(recall),
+        'f1': float(f1),
         'mcc': float(mcc),
-        'tp': tp_regions,
-        'fp': fp_regions,
-        'fn': fn_regions,
-        'gt_found': gt_found,
-        'gt_total': len(gt_regions),
-        'pred_total': len(predicted_regions),
-        'tp_bp': int(tp_bp),
-        'fp_bp': int(fp_bp),
-        'fn_bp': int(fn_bp),
-        'tn_bp': int(tn_bp),
+        'jaccard': float(jaccard),
+        'tp': int(tp),
+        'fp': int(fp),
+        'fn': int(fn),
+        'tn': int(tn),
+        'gt_regions': len(gt_regions),
+        'pred_regions': len(predicted_regions),
     }
 
 
@@ -612,10 +574,12 @@ def main():
         simple_recall = np.mean([r['simple_metrics']['recall'] for r in genomes_with_gt])
         simple_f1 = np.mean([r['simple_metrics']['f1'] for r in genomes_with_gt])
         simple_mcc = np.mean([r['simple_metrics']['mcc'] for r in genomes_with_gt])
-        print(f"  Precision: {simple_precision:.1%}")
-        print(f"  Recall:    {simple_recall:.1%}")
-        print(f"  F1:        {simple_f1:.1%}")
-        print(f"  MCC:       {simple_mcc:.3f}")
+        simple_jaccard = np.mean([r['simple_metrics']['jaccard'] for r in genomes_with_gt])
+        print(f"  Precision (region): {simple_precision:.1%}")
+        print(f"  Recall (region):    {simple_recall:.1%}")
+        print(f"  F1 (region):        {simple_f1:.1%}")
+        print(f"  MCC (base-pair):    {simple_mcc:.3f}")
+        print(f"  Jaccard (base-pair):{simple_jaccard:.3f}")
 
         if args.use_hdbscan:
             print("\nHDBSCAN Performance:")
@@ -657,15 +621,16 @@ def main():
         print(f"\nHigh accuracy (F1 >= 0.7): {len(high_acc)} genomes")
         for r in sorted(high_acc, key=lambda x: -x['simple_metrics']['f1'])[:10]:
             m = r['simple_metrics']
-            print(f"  {r['assembly']}: F1={m['f1']:.2f}, P={m['precision']:.2f}, R={m['recall']:.2f}, MCC={m['mcc']:.3f}")
+            print(f"  {r['assembly']}: P={m['precision']:.2f}, R={m['recall']:.2f}, F1={m['f1']:.2f}, MCC={m['mcc']:.3f}, Jaccard={m['jaccard']:.3f}")
+            print(f"      TP={m['tp']:,}, FP={m['fp']:,}, FN={m['fn']:,}, Regions: {m['pred_regions']} pred / {m['gt_regions']} GT")
 
         print(f"\nMedium accuracy (0.3 <= F1 < 0.7): {len(med_acc)} genomes")
-        for r in sorted(med_acc, key=lambda x: -x['simple_metrics']['f1'])[:10]:
+        for r in sorted(med_acc, key=lambda x: -x['simple_metrics']['f1'])[:5]:
             m = r['simple_metrics']
             print(f"  {r['assembly']}: F1={m['f1']:.2f}, P={m['precision']:.2f}, R={m['recall']:.2f}, MCC={m['mcc']:.3f}")
 
         print(f"\nLow accuracy (F1 < 0.3): {len(low_acc)} genomes")
-        for r in sorted(low_acc, key=lambda x: -x['simple_metrics']['f1'])[:10]:
+        for r in sorted(low_acc, key=lambda x: -x['simple_metrics']['f1'])[:5]:
             m = r['simple_metrics']
             print(f"  {r['assembly']}: F1={m['f1']:.2f}, P={m['precision']:.2f}, R={m['recall']:.2f}, MCC={m['mcc']:.3f}")
 
@@ -677,12 +642,11 @@ def main():
             bin_file = bins_dir / f"{bin_name}_accuracy_genomes.txt"
             with open(bin_file, 'w') as f:
                 f.write(f"# {bin_name.upper()} accuracy genomes (F1-based)\n")
-                f.write("# assembly\tF1\tprecision\trecall\tMCC\tgt_regions\tpred_regions\n")
+                f.write("# All metrics at NUCLEOTIDE level\n")
+                f.write("# assembly\tprecision\trecall\tF1\tMCC\tJaccard\tTP\tFP\tFN\tgt_regions\tpred_regions\n")
                 for r in sorted(bin_data, key=lambda x: -x['simple_metrics']['f1']):
                     m = r['simple_metrics']
-                    gt_total = m.get('gt_total', r.get('gt_regions', 0))
-                    pred_total = m.get('pred_total', len(r.get('simple_regions', [])))
-                    f.write(f"{r['assembly']}\t{m['f1']:.3f}\t{m['precision']:.3f}\t{m['recall']:.3f}\t{m['mcc']:.3f}\t{gt_total}\t{pred_total}\n")
+                    f.write(f"{r['assembly']}\t{m['precision']:.3f}\t{m['recall']:.3f}\t{m['f1']:.3f}\t{m['mcc']:.3f}\t{m['jaccard']:.3f}\t{m['tp']}\t{m['fp']}\t{m['fn']}\t{m['gt_regions']}\t{m['pred_regions']}\n")
             print(f"\nSaved {bin_name} accuracy list to: {bin_file}")
 
     print(f"\nResults saved to: {output_dir}")
