@@ -88,6 +88,25 @@ def get_assembly_from_filename(filename):
     return name.replace('_activations', '')
 
 
+def downsample_for_plotting(activations, max_points=50000):
+    """Downsample activations for plotting if sequence is too long."""
+    seq_len = len(activations)
+    if seq_len <= max_points:
+        return np.arange(seq_len), activations
+
+    # Use max pooling to preserve peaks
+    bin_size = seq_len // max_points
+    n_bins = seq_len // bin_size
+    truncated = activations[:n_bins * bin_size]
+    reshaped = truncated.reshape(n_bins, bin_size)
+
+    # Take max within each bin to preserve peaks
+    downsampled = reshaped.max(axis=1)
+    x_coords = np.arange(n_bins) * bin_size + bin_size // 2
+
+    return x_coords, downsampled
+
+
 def generate_plot(
     activations: np.ndarray,
     gt_regions: list,
@@ -119,11 +138,13 @@ def generate_plot(
 
     # Top: Feature activation
     ax1 = axes[0]
-    x_coords = np.arange(seq_len)
+
+    # Downsample for plotting if sequence is too long
+    x_coords, plot_activations = downsample_for_plotting(activations)
 
     # Plot activation line
-    ax1.fill_between(x_coords, 0, activations, alpha=0.3, color='blue')
-    ax1.plot(x_coords, activations, lw=0.5, alpha=0.9, color='blue')
+    ax1.fill_between(x_coords, 0, plot_activations, alpha=0.3, color='blue')
+    ax1.plot(x_coords, plot_activations, lw=0.5, alpha=0.9, color='blue')
 
     # Add threshold line
     ax1.axhline(y=threshold, color='red', linestyle='--', alpha=0.5, label=f'Threshold ({threshold})')
@@ -139,6 +160,7 @@ def generate_plot(
     ax1.set_title(f'{assembly_id} - Evo2 SAE Prophage Feature\n'
                   f'Max: {max_act:.2f} | Firing: {firing_count:,} positions | '
                   f'Precision: {precision:.1%} in GT | {len(gt_regions)} GT regions')
+    ax1.set_xlim(0, seq_len)
     ax1.set_ylim(bottom=0)
     ax1.legend(loc='upper right')
     ax1.grid(True, alpha=0.3)

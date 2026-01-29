@@ -6,14 +6,28 @@ Usage:
     # Standard run
     python test_inference.py
 
-    # Profile depthwise conv
-    ncu --set roofline --kernel-name "conv_depthwise2d" --launch-count 3 -o roofline_conv python test_inference.py
+    # Profile elementwise kernels (LAYER INTERFACE - best fusion candidate)
+    ncu --set roofline --kernel-name regex:"elementwise_kernel$" --launch-count 5 -o roofline_elem python test_inference.py
 
-    # Profile elementwise kernels
-    ncu --set roofline --kernel-name "elementwise" --launch-count 5 -o roofline_elem python test_inference.py
+    # Profile depthwise conv (Hyena short filter)
+    ncu --set roofline --kernel-name "conv_depthwise2d_forward_kernel_generic" --launch-count 3 -o roofline_conv python test_inference.py
+
+    # Profile FFT (Hyena long convolution)
+    ncu --set roofline --kernel-name "vector_fft" --launch-count 3 -o roofline_fft python test_inference.py
+
+    # Profile Flash Attention
+    ncu --set roofline --kernel-name "flash_fwd_kernel" --launch-count 3 -o roofline_attn python test_inference.py
 
     # Profile GEMM
-    ncu --set roofline --kernel-name "nvjet" --launch-count 3 -o roofline_gemm python test_inference.py
+    ncu --set roofline --kernel-name regex:"nvjet_tst" --launch-count 3 -o roofline_gemm python test_inference.py
+
+Available kernels from Evo2:
+    elementwise_kernel                      - Gating/residuals (FUSION TARGET)
+    conv_depthwise2d_forward_kernel_generic - Hyena short filter
+    vector_fft                              - Hyena FFT convolution
+    flash_fwd_kernel                        - Attention
+    nvjet_tst_*                             - GEMM operations
+    rotary_kernel                           - RoPE embeddings
 """
 
 import torch
