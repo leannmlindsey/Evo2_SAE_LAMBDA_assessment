@@ -73,98 +73,91 @@ class Config:
 class SAEModule(torch.nn.Module):
     """
     Sparse Autoencoder for Evo2.
-    
-    NOTE: Update this class after inspecting the checkpoint format!
-    The Goodfire SAE uses BatchTopK architecture.
+
+    Based on Goodfire SAE checkpoint inspection:
+    - d_model = 8192 (Evo2 hidden dimension)
+    - d_sae = 65536 (expansion factor = 8)
+    - k = 64 (TopK sparsity)
+    - Keys: W_enc, b_enc, W_dec, b_dec
     """
-    
-    def __init__(self, d_model: int, d_sae: int, k: int = 64):
+
+    def __init__(self, d_model: int = 8192, d_sae: int = 65536, k: int = 64):
         super().__init__()
         self.d_model = d_model
         self.d_sae = d_sae
         self.k = k  # TopK sparsity
-        
-        # Standard SAE architecture
-        self.encoder = torch.nn.Linear(d_model, d_sae, bias=True)
-        self.decoder = torch.nn.Linear(d_sae, d_model, bias=True)
-    
+
+        # Weights (will be loaded from checkpoint)
+        self.W_enc = torch.nn.Parameter(torch.zeros(d_sae, d_model))
+        self.b_enc = torch.nn.Parameter(torch.zeros(d_sae))
+        self.W_dec = torch.nn.Parameter(torch.zeros(d_model, d_sae))
+        self.b_dec = torch.nn.Parameter(torch.zeros(d_model))
+
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Get sparse feature activations."""
-        # Pre-activation
-        pre_acts = self.encoder(x)
-        
-        # TopK activation (simplified - BatchTopK does this across batch)
+        # x: (..., d_model) -> pre_acts: (..., d_sae)
+        pre_acts = torch.nn.functional.linear(x, self.W_enc, self.b_enc)
+
+        # TopK activation
         topk_values, topk_indices = torch.topk(pre_acts, self.k, dim=-1)
         acts = torch.zeros_like(pre_acts)
         acts.scatter_(-1, topk_indices, torch.relu(topk_values))
-        
+
         return acts
-    
+
+    def decode(self, acts: torch.Tensor) -> torch.Tensor:
+        """Reconstruct from sparse activations."""
+        return torch.nn.functional.linear(acts, self.W_dec, self.b_dec)
+
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass returning (reconstruction, activations)."""
         acts = self.encode(x)
-        recon = self.decoder(acts)
+        recon = self.decode(acts)
         return recon, acts
-    
+
     @classmethod
     def from_pretrained(cls, checkpoint_path: str, device: str = "cuda") -> "SAEModule":
-        """
-        Load pretrained SAE.
-        
-        UPDATE THIS METHOD after running inspect_sae_checkpoint.py!
+        """Load pretrained SAE from Goodfire checkpoint.
+
+        Checkpoint format:
+        - _orig_mod.W: encoder weights (d_sae, d_model), decoder is transpose
+        - _orig_mod.b_enc: encoder bias (d_sae,)
+        - _orig_mod.b_dec: decoder bias (d_model,)
         """
         print(f"Loading SAE from {checkpoint_path}")
-        
-        # Try different loading strategies based on file type
-        path = Path(checkpoint_path)
-        
-        if path.suffix == '.safetensors':
-            from safetensors.torch import load_file
-            state_dict = load_file(checkpoint_path)
+
+        state_dict = torch.load(checkpoint_path, map_location=device, weights_only=True)
+        print(f"  Checkpoint keys: {list(state_dict.keys())}")
+
+        # Get the weight matrix - handles _orig_mod prefix from torch.compile
+        if '_orig_mod.W' in state_dict:
+            W = state_dict['_orig_mod.W']
+            b_enc = state_dict['_orig_mod.b_enc']
+            b_dec = state_dict['_orig_mod.b_dec']
+        elif 'W' in state_dict:
+            W = state_dict['W']
+            b_enc = state_dict['b_enc']
+            b_dec = state_dict['b_dec']
         else:
-            state_dict = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        
-        # Handle nested state dicts
-        if isinstance(state_dict, dict) and 'state_dict' in state_dict:
-            state_dict = state_dict['state_dict']
-        
-        # Infer dimensions from weights
-        # Common key patterns: 'encoder.weight', 'W_enc', 'encode.weight'
-        encoder_key = None
-        for key in state_dict.keys():
-            if 'enc' in key.lower() and 'weight' in key.lower():
-                encoder_key = key
-                break
-        
-        if encoder_key is None:
-            raise ValueError(f"Could not find encoder weights. Keys: {list(state_dict.keys())}")
-        
-        d_sae, d_model = state_dict[encoder_key].shape
-        print(f"  Detected dimensions: d_model={d_model}, d_sae={d_sae}")
-        
-        # Create model and load weights
+            raise ValueError(f"Unexpected checkpoint format. Keys: {list(state_dict.keys())}")
+
+        # W shape: (d_sae, d_model) - encoder weights
+        d_sae, d_model = W.shape
+        print(f"  Dimensions: d_model={d_model}, d_sae={d_sae}")
+
+        # Create model
         model = cls(d_model=d_model, d_sae=d_sae)
-        
-        # Map keys (adjust based on actual checkpoint format)
-        new_state_dict = {}
-        for key, value in state_dict.items():
-            # Try to map to our architecture
-            if 'enc' in key.lower():
-                if 'weight' in key.lower():
-                    new_state_dict['encoder.weight'] = value
-                elif 'bias' in key.lower():
-                    new_state_dict['encoder.bias'] = value
-            elif 'dec' in key.lower():
-                if 'weight' in key.lower():
-                    new_state_dict['decoder.weight'] = value
-                elif 'bias' in key.lower():
-                    new_state_dict['decoder.bias'] = value
-        
-        # Load with strict=False to handle missing keys
-        model.load_state_dict(new_state_dict, strict=False)
+
+        # Load weights - this is a tied-weight SAE (W_dec = W_enc.T)
+        model.W_enc.data = W
+        model.b_enc.data = b_enc
+        model.W_dec.data = W.T  # Decoder is transpose of encoder
+        model.b_dec.data = b_dec
+
         model.to(device)
         model.eval()
-        
+
+        print(f"  ✓ SAE loaded successfully")
         return model
 
 
@@ -225,21 +218,22 @@ class ProphageDetector:
         raise FileNotFoundError(f"No checkpoint found in {sae_dir}")
     
     def get_embeddings(self, sequence: str) -> torch.Tensor:
-        """Extract embeddings from Evo2 at the SAE layer."""
+        """Extract embeddings from Evo2 at the SAE layer (block 26)."""
         # Tokenize
         input_ids = torch.tensor(
             self.model.tokenizer.tokenize(sequence),
             dtype=torch.int,
         ).unsqueeze(0).to(self.device)
-        
-        # Get embeddings - try different hook points
-        # UPDATE this based on inspect_sae_checkpoint.py output
+
+        # Based on inspect_sae_checkpoint.py output:
+        # blocks.26 is a ParallelGatedConvBlock with mlp.l3 as the MLP output
+        # The SAE was trained on layer 26 outputs (d_model=8192)
         layer_candidates = [
-            f"{self.config.sae_layer}.mlp.l3",
-            f"{self.config.sae_layer}.mixer.out_proj",
-            f"{self.config.sae_layer}",
+            "blocks.26.mlp.l3",      # MLP output (most likely)
+            "blocks.26.post_norm",   # After normalization
+            "blocks.26",             # Full block output
         ]
-        
+
         for layer_name in layer_candidates:
             try:
                 with torch.no_grad():
@@ -249,11 +243,18 @@ class ProphageDetector:
                         layer_names=[layer_name]
                     )
                 if layer_name in embeddings:
-                    return embeddings[layer_name].squeeze(0)
+                    emb = embeddings[layer_name].squeeze(0)
+                    # Verify dimension matches SAE input
+                    if emb.shape[-1] == self.sae.d_model:
+                        return emb
+                    else:
+                        print(f"    Layer {layer_name} has dim {emb.shape[-1]}, expected {self.sae.d_model}")
+                        continue
             except Exception as e:
+                print(f"    Layer {layer_name} failed: {e}")
                 continue
-        
-        raise RuntimeError(f"Could not extract embeddings. Tried: {layer_candidates}")
+
+        raise RuntimeError(f"Could not extract embeddings with d_model={self.sae.d_model}. Tried: {layer_candidates}")
     
     def get_prophage_activations(self, sequence: str) -> np.ndarray:
         """Get prophage feature activations across a sequence."""
