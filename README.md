@@ -1,8 +1,20 @@
-# Evo2 SAE Prophage Detection - Quick Start for H200 Node
+# Evo2 SAE Analysis - Prophage Detection & Embedding Extraction
 
 ## Your Setup
-- 8x H200 GPUs (Hopper architecture ✓)
+- 8x H200 GPUs (Hopper architecture)
 - No SLURM (direct execution)
+
+## Available Scripts
+
+### SAE-based Prophage Detection
+- `run_lambda_batch.py` - Batch process LAMBDA genomes with SAE feature f/19746
+- `visualize_prophage_feature.py` - Visualize prophage feature activations
+- `prophage_detection.py` - Prophage detection using SAE features
+
+### Embedding Extraction (GENERanno-style)
+- `evo2_embedding_extraction.py` - Extract embeddings from Evo2 for sequences
+- `evo2_embedding_analysis.py` - Full embedding analysis (linear probe, PCA, 3-layer NN)
+- `evo2_inference.py` - Run inference with trained classifiers
 
 ## Step-by-Step Instructions
 
@@ -131,6 +143,85 @@ The layer name might be different. Check the output of `inspect_sae_checkpoint.p
 - Use `evo2_7b` instead of `evo2_40b`
 
 
+
+---
+
+## Embedding Extraction & Analysis (GENERanno-style)
+
+These scripts follow the same workflow as GENERanno for downstream task evaluation.
+
+### 1. Extract Embeddings
+
+```bash
+# Extract embeddings from a single CSV file
+python evo2_embedding_extraction.py \
+    --input_csv /path/to/sequences.csv \
+    --output_dir ./embeddings \
+    --model evo2_7b \
+    --layer blocks.28.mlp.l3 \
+    --pooling mean
+```
+
+Input CSV format:
+```csv
+sequence,label
+ATCGATCG...,1
+GCTAGCTA...,0
+```
+
+### 2. Full Embedding Analysis
+
+```bash
+# Run complete analysis pipeline (linear probe, PCA, 3-layer NN)
+python evo2_embedding_analysis.py \
+    --csv_dir /path/to/data \
+    --output_dir ./results \
+    --model evo2_7b \
+    --layer blocks.28.mlp.l3 \
+    --pooling mean
+```
+
+The `csv_dir` should contain:
+- `train.csv`
+- `dev.csv` (or `val.csv`)
+- `test.csv`
+
+Output files:
+- `embeddings.npz` - Cached embeddings
+- `embedding_analysis_results.json` - All metrics
+- `pca_visualization.png` - PCA plot
+- `test_predictions.csv` - Test set predictions
+- `three_layer_nn.pt` - Trained classifier
+
+### 3. Inference with Trained Classifier
+
+```bash
+# Using pre-trained 3-layer NN
+python evo2_inference.py \
+    --input_csv /path/to/test.csv \
+    --classifier_path ./results/three_layer_nn.pt \
+    --output_csv predictions.csv \
+    --save_metrics
+```
+
+### Available Layers for Embedding Extraction
+
+Common layer names for Evo2 7B:
+- `blocks.28.mlp.l3` - MLP output at layer 28 (recommended)
+- `blocks.26` - Full layer 26 output (used for SAE)
+- `blocks.{N}.mlp.l3` - MLP output at any layer N
+
+### Or Use the Pipeline Script
+
+```bash
+./run_evo2_embedding_pipeline.sh \
+    --csv_dir /path/to/data \
+    --model evo2_7b \
+    --layer blocks.28.mlp.l3 \
+    --output_dir ./results
+```
+
+---
 
 ## Questions?
 
