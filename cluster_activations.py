@@ -295,10 +295,18 @@ def calculate_metrics(predicted_regions, gt_regions, seq_len):
     tn_bp = np.sum(~pred_mask & ~gt_mask)
 
     # MCC = (TP*TN - FP*FN) / sqrt((TP+FP)(TP+FN)(TN+FP)(TN+FN))
+    # Use sqrt of products to avoid overflow: sqrt(a*b*c*d) = sqrt(a*b) * sqrt(c*d)
+    tp_bp = np.float64(tp_bp)
+    fp_bp = np.float64(fp_bp)
+    fn_bp = np.float64(fn_bp)
+    tn_bp = np.float64(tn_bp)
+
     numerator = (tp_bp * tn_bp) - (fp_bp * fn_bp)
-    denominator = np.sqrt(
-        (tp_bp + fp_bp) * (tp_bp + fn_bp) * (tn_bp + fp_bp) * (tn_bp + fn_bp)
-    )
+    # Split sqrt to avoid overflow: sqrt(a*b*c*d) = sqrt(a*b) * sqrt(c*d)
+    denom_part1 = np.sqrt((tp_bp + fp_bp) * (tp_bp + fn_bp))
+    denom_part2 = np.sqrt((tn_bp + fp_bp) * (tn_bp + fn_bp))
+    denominator = denom_part1 * denom_part2
+
     mcc = numerator / denominator if denominator > 0 else 0.0
 
     return {
