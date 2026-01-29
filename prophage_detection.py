@@ -319,14 +319,17 @@ class ProphageDetector:
         return feats.cpu().detach().float().numpy()
 
     def get_prophage_activations(self, sequence: str) -> np.ndarray:
-        """Get prophage feature activations across a sequence."""
+        """Get prophage feature activations across a sequence.
+
+        Uses MAX across overlapping windows (not average) because the
+        prophage signal is sparse - only ~1% of positions fire.
+        """
         seq_len = len(sequence)
         window_size = self.config.window_size
         overlap = self.config.overlap
 
-        # Initialize
+        # Initialize with zeros - will take max
         activations = np.zeros(seq_len)
-        counts = np.zeros(seq_len)
 
         # Process in windows
         positions = list(range(0, seq_len, window_size - overlap))
@@ -347,16 +350,17 @@ class ProphageDetector:
 
                 # Handle length mismatch (tokenization may differ from bp)
                 actual_len = min(len(prophage_acts), end - start)
-                activations[start:start+actual_len] += prophage_acts[:actual_len]
-                counts[start:start+actual_len] += 1
+
+                # Take MAX across overlapping windows (not average)
+                # This preserves the sparse signal
+                activations[start:start+actual_len] = np.maximum(
+                    activations[start:start+actual_len],
+                    prophage_acts[:actual_len]
+                )
 
             except Exception as e:
                 print(f"    Warning: Error at position {start}: {e}")
                 continue
-
-        # Average overlapping regions
-        counts[counts == 0] = 1
-        activations = activations / counts
 
         return activations
     
