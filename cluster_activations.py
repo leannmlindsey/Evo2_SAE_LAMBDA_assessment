@@ -32,6 +32,131 @@ import matplotlib.pyplot as plt
 from sklearn.cluster import HDBSCAN, OPTICS
 
 
+# =============================================================================
+# NORMALIZATION FUNCTIONS
+# =============================================================================
+
+def normalize_activations(activations, method='none', window_size=10000):
+    """
+    Normalize activations to account for varying baseline levels across genomes.
+
+    Args:
+        activations: Raw activation values (1D numpy array)
+        method: Normalization method:
+            - 'none': No normalization (original behavior)
+            - 'zscore': Standard z-score (x - mean) / std
+            - 'robust_zscore': Robust z-score using median/MAD
+            - 'percentile': (x - P25) / IQR - robust to outliers
+            - 'local_baseline': x - rolling_median (handles varying baseline within genome)
+            - 'minmax': Scale to [0, 1] range
+            - 'quantile': Rank-based normalization to uniform distribution
+        window_size: Window size for local_baseline method (default 10kb)
+
+    Returns:
+        Normalized activations (same shape as input)
+    """
+    if method == 'none':
+        return activations
+
+    acts = activations.astype(np.float64)
+
+    if method == 'zscore':
+        # Standard z-score normalization
+        mean = np.mean(acts)
+        std = np.std(acts)
+        if std > 0:
+            return (acts - mean) / std
+        return acts - mean
+
+    elif method == 'robust_zscore':
+        # Robust z-score using median and MAD (median absolute deviation)
+        # More robust to outliers (like prophage peaks)
+        median = np.median(acts)
+        mad = np.median(np.abs(acts - median))
+        # Scale MAD to be consistent with std for normal distribution
+        mad_scaled = mad * 1.4826
+        if mad_scaled > 0:
+            return (acts - median) / mad_scaled
+        return acts - median
+
+    elif method == 'percentile':
+        # Percentile-based normalization
+        # Baseline = 25th percentile, scale by IQR
+        p25 = np.percentile(acts, 25)
+        p75 = np.percentile(acts, 75)
+        iqr = p75 - p25
+        if iqr > 0:
+            return (acts - p25) / iqr
+        return acts - p25
+
+    elif method == 'local_baseline':
+        # Local baseline subtraction using rolling median
+        # Handles cases where baseline varies across the genome
+        import pandas as pd
+        df = pd.Series(acts)
+        # Use rolling median as local baseline estimate
+        baseline = df.rolling(window=window_size, center=True, min_periods=1).median()
+        # Also estimate local spread using rolling MAD
+        local_mad = df.rolling(window=window_size, center=True, min_periods=1).apply(
+            lambda x: np.median(np.abs(x - np.median(x))) * 1.4826, raw=True
+        )
+        # Normalize: (x - local_baseline) / local_spread
+        local_mad = local_mad.fillna(1.0).replace(0, 1.0)
+        normalized = (acts - baseline.values) / local_mad.values
+        return normalized
+
+    elif method == 'minmax':
+        # Min-max scaling to [0, 1]
+        min_val = np.min(acts)
+        max_val = np.max(acts)
+        if max_val > min_val:
+            return (acts - min_val) / (max_val - min_val)
+        return np.zeros_like(acts)
+
+    elif method == 'quantile':
+        # Quantile normalization - transform to uniform distribution
+        from scipy import stats
+        ranks = stats.rankdata(acts)
+        return ranks / len(ranks)
+
+    else:
+        raise ValueError(f"Unknown normalization method: {method}")
+
+
+def compute_adaptive_threshold(activations, method='mad', k=3.0):
+    """
+    Compute an adaptive threshold based on the genome's activation distribution.
+
+    Args:
+        activations: Raw or normalized activation values
+        method: Method for threshold computation:
+            - 'mad': median + k * MAD (robust)
+            - 'std': mean + k * std (standard)
+            - 'percentile': k-th percentile (e.g., k=95 for 95th percentile)
+        k: Multiplier for mad/std, or percentile value
+
+    Returns:
+        Computed threshold value
+    """
+    acts = activations.astype(np.float64)
+
+    if method == 'mad':
+        median = np.median(acts)
+        mad = np.median(np.abs(acts - median)) * 1.4826
+        return median + k * mad
+
+    elif method == 'std':
+        mean = np.mean(acts)
+        std = np.std(acts)
+        return mean + k * std
+
+    elif method == 'percentile':
+        return np.percentile(acts, k)
+
+    else:
+        raise ValueError(f"Unknown threshold method: {method}")
+
+
 def load_ground_truth(csv_path):
     """Load ground truth prophage regions."""
     gt = {}
@@ -351,13 +476,22 @@ def calculate_metrics(predicted_regions, gt_regions, seq_len):
     }
 
 
-def process_genome(activations, assembly_id, gt_regions, args):
-    """Process a single genome and return clustering results."""
+def process_genome(activations, assembly_id, gt_regions, args, threshold_override=None):
+    """Process a single genome and return clustering results.
+
+    Args:
+        activations: Activation values (possibly normalized)
+        assembly_id: Assembly identifier
+        gt_regions: Ground truth regions
+        args: Command line arguments
+        threshold_override: If provided, use this threshold instead of args.threshold
+    """
 
     seq_len = len(activations)
+    threshold = threshold_override if threshold_override is not None else args.threshold
 
     # Find positions above threshold (for simple clustering)
-    positions = np.where(activations > args.threshold)[0]
+    positions = np.where(activations > threshold)[0]
 
     results = {
         'assembly': assembly_id,
@@ -571,6 +705,20 @@ def main():
     # Threshold for considering a position "active"
     parser.add_argument("--threshold", type=float, default=0.3, help="Activation threshold (default: 0.3)")
 
+    # Normalization options
+    parser.add_argument("--normalize", type=str, default="none",
+                        choices=['none', 'zscore', 'robust_zscore', 'percentile', 'local_baseline', 'minmax', 'quantile'],
+                        help="Normalization method: none, zscore, robust_zscore, percentile, local_baseline, minmax, quantile (default: none)")
+    parser.add_argument("--norm_window", type=int, default=10000,
+                        help="Window size for local_baseline normalization (default: 10kb)")
+    parser.add_argument("--adaptive_threshold", action="store_true",
+                        help="Use adaptive threshold per genome instead of fixed threshold")
+    parser.add_argument("--adaptive_method", type=str, default="mad",
+                        choices=['mad', 'std', 'percentile'],
+                        help="Method for adaptive threshold: mad, std, percentile (default: mad)")
+    parser.add_argument("--adaptive_k", type=float, default=3.0,
+                        help="Multiplier for adaptive threshold (default: 3.0 = median + 3*MAD)")
+
     # Clustering parameters
     parser.add_argument("--max_gap", type=int, default=100, help="Max gap between positions in simple clustering (default: 100bp)")
     parser.add_argument("--use_mws", action="store_true", help="Use Moving Window Sum algorithm (from Phoenix dashboard)")
@@ -604,6 +752,10 @@ def main():
     print("=" * 60)
     print(f"Results dir: {args.results_dir}")
     print(f"Threshold: {args.threshold}")
+    if args.normalize != 'none':
+        print(f"Normalization: {args.normalize}" + (f" (window={args.norm_window})" if args.normalize == 'local_baseline' else ""))
+    if args.adaptive_threshold:
+        print(f"Adaptive threshold: {args.adaptive_method} (k={args.adaptive_k})")
     print(f"Min region size: {args.min_region_size} bp")
     print(f"Merge distance: {args.merge_distance} bp")
     print(f"Clustering params: min_cluster_size={args.min_cluster_size}, min_samples={args.min_samples}")
@@ -640,6 +792,27 @@ def main():
                 activations[win_start:trim_end] = 0.0
                 win_idx += 1
 
+        # Store raw activations for plotting (before normalization)
+        raw_activations = activations.copy()
+
+        # Apply normalization if requested
+        if args.normalize != 'none':
+            activations = normalize_activations(
+                activations,
+                method=args.normalize,
+                window_size=args.norm_window
+            )
+
+        # Compute adaptive threshold if requested
+        if args.adaptive_threshold:
+            effective_threshold = compute_adaptive_threshold(
+                activations,
+                method=args.adaptive_method,
+                k=args.adaptive_k
+            )
+        else:
+            effective_threshold = args.threshold
+
         # Get ground truth
         gt_regions = gt.get(assembly_id, [])
         if not gt_regions:
@@ -649,7 +822,9 @@ def main():
                     break
 
         # Process
-        results = process_genome(activations, assembly_id, gt_regions, args)
+        results = process_genome(activations, assembly_id, gt_regions, args,
+                                  threshold_override=effective_threshold)
+        results['effective_threshold'] = effective_threshold  # Store for reference
         all_results.append(results)
 
         # Save BED files
@@ -676,14 +851,18 @@ def main():
             # Get metrics for the primary method (simple clustering)
             metrics = results.get('simple_metrics', {})
 
+            # Use normalized activations for plot if normalization applied
+            # This shows the signal as the algorithm sees it
+            plot_activations = activations if args.normalize != 'none' else raw_activations
+
             plot_comparison(
-                activations,
+                plot_activations,
                 results['simple_regions'],
                 second_method_regions,
                 gt_regions,
                 assembly_id,
                 plots_dir / f"{assembly_id}_clusters.png",
-                args.threshold,
+                effective_threshold,
                 second_method_name,
                 metrics=metrics,
                 taxonomy=taxonomy,
