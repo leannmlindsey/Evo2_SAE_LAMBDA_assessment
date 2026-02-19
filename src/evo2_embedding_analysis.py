@@ -211,7 +211,7 @@ def extract_embeddings(
 
                 layer_embeddings = embeddings[layer_name]
                 pooled = pool_embeddings(layer_embeddings, pooling)
-                all_embeddings.append(pooled.cpu().numpy())
+                all_embeddings.append(pooled.cpu().float().numpy())
                 all_labels.append(label)
 
     embeddings_array = np.vstack(all_embeddings)

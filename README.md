@@ -282,13 +282,80 @@ python src/create_categorized_pdfs.py \
 
 ## Embedding Evaluation
 
-**Script:** `src/evo2_embedding_analysis.py`
+Measure the quality of Evo2 embeddings by training downstream classifiers (linear probe + 3-layer NN) and comparing against a random baseline. This follows the GENERanno evaluation pattern to compute **embedding power** — the performance gain of pretrained embeddings over random noise.
 
-Measure the quality of Evo2 embeddings by training downstream classifiers and optionally comparing against a random baseline. This follows the GENERanno evaluation pattern: extract pretrained embeddings, train classifiers, then repeat with random (Gaussian noise) embeddings to compute **embedding power** — the performance gain attributable to the pretrained model.
+The pipeline:
+1. Extract embeddings from the pretrained Evo2 model (or load cached embeddings)
+2. Train a linear probe (logistic regression) and a 3-layer NN on the pretrained embeddings
+3. Generate random Gaussian embeddings of the same shape
+4. Train the same classifiers on random embeddings
+5. Compute embedding power = pretrained metrics − random metrics
+6. Output all results to a single JSON file, with separate PCA plots and prediction CSVs
 
 ### Input format
 
 A directory containing `train.csv`, `dev.csv` (or `val.csv`), and `test.csv`. Each CSV must have `sequence` and `label` columns.
+
+### Running with wrapper scripts (recommended)
+
+Three scripts follow the GENERanno three-tier pattern:
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/wrapper_run_embedding_analysis.sh` | **Edit this file.** Set your paths and parameters, then run it to submit a SLURM job. |
+| `scripts/run_embedding_analysis.sh` | SLURM batch script (`#SBATCH` headers). Called by the wrapper — do not edit unless changing HPC resources. |
+| `scripts/run_embedding_analysis_interactive.sh` | Runs directly on the current node (no SLURM). Sources config from the wrapper. |
+
+**Step 1: Edit the wrapper script**
+
+Open `scripts/wrapper_run_embedding_analysis.sh` and set the configuration variables:
+
+```bash
+# === REQUIRED ===
+export CSV_DIR="/data/lindleys/prophage_segments"    # your actual data path
+
+# === OPTIONAL (defaults shown) ===
+export MODEL="evo2_7b"                   # evo2_7b or evo2_40b
+export LAYER="blocks.28.mlp.l3"          # layer for embedding extraction
+export OUTPUT_DIR=""                      # leave empty for auto: ./results/embedding_analysis/<dataset>
+export BATCH_SIZE="1"
+export MAX_LENGTH=""                      # leave empty for no truncation
+export POOLING="mean"                    # mean, first, last, max
+export SEED="42"
+export NN_EPOCHS="100"
+export NN_HIDDEN_DIM="256"
+export NN_LR="0.001"
+export INCLUDE_RANDOM_BASELINE="true"    # "true" or "false"
+```
+
+**Step 2: Run**
+
+```bash
+# Option A: Submit as a SLURM batch job
+bash scripts/wrapper_run_embedding_analysis.sh
+
+# Option B: Run interactively on the current node (e.g., from an sinteractive session)
+bash scripts/run_embedding_analysis_interactive.sh
+```
+
+The interactive script reads the same configuration from the wrapper, so you only edit one file. You can also point it at a different wrapper:
+
+```bash
+bash scripts/run_embedding_analysis_interactive.sh scripts/my_custom_wrapper.sh
+```
+
+### Running the Python script directly
+
+If you prefer to bypass the wrapper scripts:
+
+```bash
+python src/evo2_embedding_analysis.py \
+    --csv_dir /path/to/csv/data \
+    --output_dir ./results/embedding_analysis \
+    --model evo2_7b \
+    --layer blocks.28.mlp.l3 \
+    --include_random_baseline
+```
 
 ### CLI arguments
 
@@ -306,38 +373,6 @@ A directory containing `train.csv`, `dev.csv` (or `val.csv`), and `test.csv`. Ea
 | `--nn_hidden_dim` | `256` | Hidden dimension for 3-layer NN |
 | `--nn_lr` | `0.001` | Learning rate for 3-layer NN |
 | `--include_random_baseline` | off | Include random embedding baseline |
-
-### Example
-
-```bash
-# Without random baseline
-python src/evo2_embedding_analysis.py \
-    --csv_dir /path/to/csv/data \
-    --output_dir ./results/embedding_analysis \
-    --model evo2_7b \
-    --layer blocks.28.mlp.l3
-
-# With random baseline (recommended)
-python src/evo2_embedding_analysis.py \
-    --csv_dir /path/to/csv/data \
-    --output_dir ./results/embedding_analysis \
-    --model evo2_7b \
-    --layer blocks.28.mlp.l3 \
-    --include_random_baseline
-```
-
-Or use the wrapper scripts (GENERanno-style three-tier pattern):
-
-```bash
-# 1. Edit configuration in the wrapper script
-vi scripts/wrapper_run_embedding_analysis.sh   # set CSV_DIR, MODEL, etc.
-
-# 2a. Submit as SLURM batch job
-bash scripts/wrapper_run_embedding_analysis.sh
-
-# 2b. Or run interactively on current node
-bash scripts/run_embedding_analysis_interactive.sh
-```
 
 ### Output files
 

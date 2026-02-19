@@ -167,7 +167,7 @@ def extract_embeddings(
                 # Pool to single vector
                 pooled = pool_embeddings(layer_embeddings, pooling)
 
-                all_embeddings.append(pooled.cpu().numpy())
+                all_embeddings.append(pooled.cpu().float().numpy())
 
     return np.vstack(all_embeddings)
 
