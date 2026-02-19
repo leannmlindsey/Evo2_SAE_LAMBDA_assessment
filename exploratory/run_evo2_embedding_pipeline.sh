@@ -69,7 +69,7 @@ echo "Output: $OUTPUT_DIR"
 echo ""
 
 # Run embedding analysis
-python evo2_embedding_analysis.py \
+python exploratory/evo2_embedding_analysis.py \
     --csv_dir $CSV_DIR \
     --output_dir $OUTPUT_DIR \
     --model $MODEL \

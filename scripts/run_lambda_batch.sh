@@ -20,7 +20,7 @@ echo "Ground truth: $GROUND_TRUTH"
 echo "Output: $OUTPUT_DIR"
 echo ""
 
-python run_lambda_batch.py \
+python src/run_lambda_batch.py \
     --fasta_dir $FASTA_DIR \
     --ground_truth $GROUND_TRUTH \
     --output_dir $OUTPUT_DIR \

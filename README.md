@@ -52,7 +52,7 @@ This installs: `numpy`, `pandas`, `matplotlib`, `scikit-learn`, `scipy`, `tqdm`,
 
 ## Quick Start: Inference on Short Segments
 
-**Script:** `sae_inference.py`
+**Script:** `src/sae_inference.py`
 
 Run SAE feature extraction on a CSV of short (~2 kb) DNA segments and get per-segment activation metrics.
 
@@ -98,7 +98,7 @@ The input columns are preserved, with these columns appended:
 ### Example
 
 ```bash
-python sae_inference.py \
+python src/sae_inference.py \
     --input_csv gc_control_2k_test.csv \
     --output gc_control_2k_results.csv \
     --max_threshold 0.5 \
@@ -107,7 +107,7 @@ python sae_inference.py \
 
 ## Genome-Wide Scanning
 
-**Script:** `run_lambda_batch.py`
+**Script:** `src/run_lambda_batch.py`
 
 Process full bacterial genomes (~1-10 Mb) by sliding a window across the genome and extracting SAE feature activations at each position.
 
@@ -141,7 +141,7 @@ Process full bacterial genomes (~1-10 Mb) by sliding a window across the genome 
 ### Example
 
 ```bash
-python run_lambda_batch.py \
+python src/run_lambda_batch.py \
     --fasta_dir /path/to/LAMBDA/FASTA \
     --ground_truth /path/to/Lambda_Genome_Wide_Evaluation_Test_Set.csv \
     --output_dir ./lambda_results_7b
@@ -149,7 +149,7 @@ python run_lambda_batch.py \
 
 ## Post-Processing: Activations to Predicted Regions
 
-**Script:** `cluster_activations.py`
+**Script:** `src/cluster_activations.py`
 
 Convert per-position SAE activation arrays into discrete predicted prophage regions using a pipeline of normalize, threshold, cluster, filter, and merge.
 
@@ -193,7 +193,7 @@ Convert per-position SAE activation arrays into discrete predicted prophage regi
 ### Example (best parameters)
 
 ```bash
-python cluster_activations.py \
+python src/cluster_activations.py \
     --results_dir ./lambda_results_7b \
     --ground_truth /path/to/Lambda_Genome_Wide_Evaluation_Test_Set.csv \
     --output_dir ./clustering_results_best \
@@ -210,7 +210,7 @@ Output includes BED files per genome, comparison plots, accuracy bins (high/medi
 
 ### Step 1: Generate activation plots
 
-**Script:** `generate_lambda_plots.py`
+**Script:** `src/generate_lambda_plots.py`
 
 Creates PNG plots from `.npy` activation files overlaid with ground truth prophage regions.
 
@@ -223,7 +223,7 @@ Creates PNG plots from `.npy` activation files overlaid with ground truth propha
 | `--dpi` | `150` | DPI for output images |
 
 ```bash
-python generate_lambda_plots.py \
+python src/generate_lambda_plots.py \
     --results_dir ./lambda_results_7b \
     --ground_truth /path/to/Lambda_Genome_Wide_Evaluation_Test_Set.csv \
     --output_dir ./lambda_plots
@@ -231,7 +231,7 @@ python generate_lambda_plots.py \
 
 ### Step 2: Analyze performance factors
 
-**Script:** `analyze_performance_factors.py`
+**Script:** `src/analyze_performance_factors.py`
 
 Computes per-genome statistics (GC content, genome size, taxonomy) and correlates them with detection performance (F1, precision, recall, MCC). Generates comparison plots and a `genome_stats.csv`.
 
@@ -243,7 +243,7 @@ Computes per-genome statistics (GC content, genome size, taxonomy) and correlate
 | `--output_dir` | `./performance_analysis` | Output directory |
 
 ```bash
-python analyze_performance_factors.py \
+python src/analyze_performance_factors.py \
     --clustering_results ./clustering_results_best/clustering_results.json \
     --ground_truth /path/to/Lambda_Genome_Wide_Evaluation_Test_Set.csv \
     --fasta_dir /path/to/LAMBDA/FASTA \
@@ -252,7 +252,7 @@ python analyze_performance_factors.py \
 
 ### Step 3: Create categorized PDF reports
 
-**Script:** `create_categorized_pdfs.py`
+**Script:** `src/create_categorized_pdfs.py`
 
 Generates categorized PDF reports (high, medium, low performance) with plots arranged 3 per page. Can use genome stats for full annotations or work standalone with plot summaries.
 
@@ -270,12 +270,12 @@ Generates categorized PDF reports (high, medium, low performance) with plots arr
 
 ```bash
 # With full stats (preferred)
-python create_categorized_pdfs.py \
+python src/create_categorized_pdfs.py \
     --plots_dir ./clustering_results_best/plots \
     --genome_stats ./performance_analysis/genome_stats.csv
 
 # Standalone with clustering results
-python create_categorized_pdfs.py \
+python src/create_categorized_pdfs.py \
     --plots_dir ./clustering_results_best/plots \
     --clustering_results ./clustering_results_best/clustering_results.json
 ```
@@ -286,13 +286,13 @@ End-to-end pipeline from raw FASTA files to benchmark results:
 
 ```bash
 # Step 1: Genome-wide scanning (requires GPU + Evo2)
-python run_lambda_batch.py \
+python src/run_lambda_batch.py \
     --fasta_dir /path/to/LAMBDA/FASTA \
     --ground_truth /path/to/Lambda_Genome_Wide_Evaluation_Test_Set.csv \
     --output_dir ./lambda_results_7b
 
 # Step 2: Cluster activations into predicted regions (CPU only)
-python cluster_activations.py \
+python src/cluster_activations.py \
     --results_dir ./lambda_results_7b \
     --ground_truth /path/to/Lambda_Genome_Wide_Evaluation_Test_Set.csv \
     --output_dir ./clustering_results_best \
@@ -303,20 +303,20 @@ python cluster_activations.py \
     --min_region_size 1000
 
 # Step 3: Generate plots (CPU only)
-python generate_lambda_plots.py \
+python src/generate_lambda_plots.py \
     --results_dir ./lambda_results_7b \
     --ground_truth /path/to/Lambda_Genome_Wide_Evaluation_Test_Set.csv \
     --output_dir ./lambda_plots
 
 # Step 4: Analyze performance factors (CPU only)
-python analyze_performance_factors.py \
+python src/analyze_performance_factors.py \
     --clustering_results ./clustering_results_best/clustering_results.json \
     --ground_truth /path/to/Lambda_Genome_Wide_Evaluation_Test_Set.csv \
     --fasta_dir /path/to/LAMBDA/FASTA \
     --output_dir ./performance_analysis
 
 # Step 5: Create PDF reports (CPU only)
-python create_categorized_pdfs.py \
+python src/create_categorized_pdfs.py \
     --plots_dir ./clustering_results_best/plots \
     --genome_stats ./performance_analysis/genome_stats.csv \
     --output_dir ./categorized_pdfs
@@ -334,16 +334,24 @@ These are nucleotide-level metrics averaged across LAMBDA genomes with ground tr
 
 ## Repository Structure
 
-| File | Description |
-|------|-------------|
-| `sae_inference.py` | SAE inference on short DNA segments (CSV in, CSV out) |
-| `run_lambda_batch.py` | Genome-wide scanning with windowed SAE feature extraction |
-| `cluster_activations.py` | Convert activation arrays to predicted prophage regions |
-| `generate_lambda_plots.py` | Generate PNG activation plots per genome |
-| `analyze_performance_factors.py` | Correlate performance with genome stats (GC, size, taxonomy) |
-| `create_categorized_pdfs.py` | Categorized PDF reports (high/medium/low performance) |
-| `environment.yml` | Conda environment for analysis-only (no GPU) |
-| `METHODS_SUMMARY.md` | Technical summary of the SAE extraction and post-processing methods |
+```
+├── src/                              # Core pipeline scripts
+│   ├── sae_inference.py              # SAE inference on short DNA segments (CSV in, CSV out)
+│   ├── run_lambda_batch.py           # Genome-wide scanning with windowed SAE feature extraction
+│   ├── cluster_activations.py        # Convert activation arrays to predicted prophage regions
+│   ├── generate_lambda_plots.py      # Generate PNG activation plots per genome
+│   ├── analyze_performance_factors.py # Correlate performance with genome stats (GC, size, taxonomy)
+│   └── create_categorized_pdfs.py    # Categorized PDF reports (high/medium/low performance)
+├── scripts/                          # Bash wrappers & setup
+│   ├── setup.sh                      # Environment setup script
+│   └── run_lambda_batch.sh           # Batch processing wrapper
+├── exploratory/                      # Non-core development & profiling scripts
+├── experiments/                      # Parameter sweep experiments
+│   └── normalization/                # Normalization & threshold experiments
+├── environment.yml                   # Conda environment for analysis-only (no GPU)
+├── METHODS_SUMMARY.md                # Technical summary of SAE extraction and post-processing
+└── PROFILING_SUMMARY.md              # Evo2 profiling results and optimization notes
+```
 
 ## References & Links
 
