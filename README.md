@@ -95,7 +95,57 @@ The input columns are preserved, with these columns appended:
 | `--save_activations` | off | Save per-segment `.npy` activation arrays |
 | `--batch_size` | `1` | Batch size (reserved for future use) |
 
-### Example
+### Running with wrapper scripts (recommended)
+
+For batch inference on multiple input files, use the GENERanno-style wrapper scripts:
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/wrapper_run_batch_sae_inference.sh` | **Edit this file.** Set your input file list, output dir, and parameters. |
+| `scripts/submit_batch_sae_inference.sh` | Reads the input list and submits one SLURM job per file. Called by the wrapper. |
+| `scripts/run_sae_inference.sh` | SLURM batch script for a single input file. Called by the submit script. |
+| `scripts/run_batch_sae_inference_interactive.sh` | Runs all files sequentially on the current node (no SLURM). Sources config from the wrapper. |
+
+**Step 1: Create an input file list**
+
+Create a text file with one input CSV path per line:
+
+```
+/data/prophage/dataset1.csv
+/data/prophage/dataset2.csv
+/data/prophage/dataset3.csv
+```
+
+**Step 2: Edit the wrapper script**
+
+Open `scripts/wrapper_run_batch_sae_inference.sh` and set the configuration:
+
+```bash
+INPUT_LIST="/path/to/input_files.txt"
+OUTPUT_DIR="/path/to/output_directory"
+MODEL="evo2_7b"
+FEATURE_IDX="19746"
+MAX_THRESHOLD="0.5"
+MEAN_THRESHOLD="0.1"
+FRACTION_THRESHOLD="0.3"
+SAVE_ACTIVATIONS="true"
+```
+
+**Step 3: Run**
+
+```bash
+# Option A: Submit one SLURM job per input file
+bash scripts/wrapper_run_batch_sae_inference.sh
+
+# Option B: Run all files sequentially on the current node
+bash scripts/run_batch_sae_inference_interactive.sh
+```
+
+Output files are named `<input_basename>_sae_results.csv` in the output directory.
+
+### Running the Python script directly
+
+For a single file without the wrapper:
 
 ```bash
 python src/sae_inference.py \
@@ -461,9 +511,13 @@ These are nucleotide-level metrics averaged across LAMBDA genomes with ground tr
 ├── scripts/                          # Bash wrappers & setup
 │   ├── setup.sh                      # Environment setup script
 │   ├── run_lambda_batch.sh           # Batch processing wrapper
-│   ├── wrapper_run_embedding_analysis.sh    # User config + sbatch submission
-│   ├── run_embedding_analysis.sh            # SLURM batch script
-│   └── run_embedding_analysis_interactive.sh # Interactive (no sbatch) runner
+│   ├── wrapper_run_batch_sae_inference.sh       # SAE inference: user config + submit
+│   ├── submit_batch_sae_inference.sh            # SAE inference: submit one job per file
+│   ├── run_sae_inference.sh                     # SAE inference: SLURM single-file script
+│   ├── run_batch_sae_inference_interactive.sh   # SAE inference: interactive batch runner
+│   ├── wrapper_run_embedding_analysis.sh        # Embedding eval: user config + submit
+│   ├── run_embedding_analysis.sh                # Embedding eval: SLURM batch script
+│   └── run_embedding_analysis_interactive.sh    # Embedding eval: interactive runner
 ├── exploratory/                      # Non-core development & profiling scripts
 ├── experiments/                      # Parameter sweep experiments
 │   └── normalization/                # Normalization & threshold experiments
