@@ -858,7 +858,9 @@ def plot_roc_pr(datasets, output_dir):
 
             # ROC
             fprs, tprs, _ = compute_roc(labels, scores)
-            auc = np.trapz(tprs[::-1], fprs[::-1])
+            # np.trapezoid in numpy>=2.0, np.trapz in older versions
+            _trapz = getattr(np, 'trapezoid', None) or np.trapz
+            auc = _trapz(tprs[::-1], fprs[::-1])
             axes[0, col].plot(fprs, tprs, linewidth=2, label=f'AUC={auc:.3f}')
             axes[0, col].plot([0, 1], [0, 1], 'k--', alpha=0.3)
             axes[0, col].set_xlabel('False Positive Rate')
