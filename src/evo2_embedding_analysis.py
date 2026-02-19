@@ -8,13 +8,15 @@ This script performs embedding analysis similar to GENERanno:
 3. Calculates silhouette score to measure embedding quality
 4. Creates PCA visualization showing class separation
 5. Trains a simple 3-layer neural network classifier
+6. Optionally compares against random baseline to measure "embedding power"
 
 Usage:
     python evo2_embedding_analysis.py \
         --csv_dir /path/to/csv/data \
         --output_dir ./results/embedding_analysis \
         --model evo2_7b \
-        --layer blocks.28.mlp.l3
+        --layer blocks.28.mlp.l3 \
+        --include_random_baseline
 """
 
 import argparse
@@ -120,6 +122,11 @@ def parse_arguments() -> argparse.Namespace:
         type=float,
         default=1e-3,
         help="Learning rate for 3-layer NN",
+    )
+    parser.add_argument(
+        "--include_random_baseline",
+        action="store_true",
+        help="Include random embedding baseline to measure embedding power",
     )
     return parser.parse_args()
 
@@ -508,6 +515,155 @@ def train_three_layer_nn(
     return metrics, model, scaler, predictions
 
 
+def generate_random_embeddings(n_samples: int, hidden_dim: int, seed: int) -> np.ndarray:
+    """Generate random baseline embeddings (Gaussian noise).
+
+    This serves as a null baseline — if the pretrained model has learned meaningful
+    structure, classifiers trained on its embeddings should significantly outperform
+    classifiers trained on random embeddings of the same shape.
+    """
+    rng = np.random.RandomState(seed)
+    return rng.randn(n_samples, hidden_dim)
+
+
+def run_random_baseline(
+    train_labels: np.ndarray,
+    val_labels: np.ndarray,
+    test_labels: np.ndarray,
+    hidden_dim: int,
+    seed: int,
+    nn_hidden_dim: int,
+    nn_epochs: int,
+    nn_lr: float,
+    device: torch.device,
+    output_dir: str,
+) -> Tuple[Dict[str, float], Dict]:
+    """Run the full evaluation pipeline on random embeddings.
+
+    Returns:
+        Tuple of (metrics dict with 'random_' prefix, predictions dict)
+    """
+    print("\n" + "#" * 60)
+    print("RANDOM BASELINE EVALUATION")
+    print("#" * 60)
+    print(f"Generating random embeddings: ({len(train_labels)}, {hidden_dim}), "
+          f"({len(val_labels)}, {hidden_dim}), ({len(test_labels)}, {hidden_dim})")
+
+    # Generate random embeddings matching pretrained shapes
+    train_random = generate_random_embeddings(len(train_labels), hidden_dim, seed)
+    val_random = generate_random_embeddings(len(val_labels), hidden_dim, seed + 1)
+    test_random = generate_random_embeddings(len(test_labels), hidden_dim, seed + 2)
+
+    results = {}
+
+    # Linear probe on random embeddings
+    lp_metrics, lp_preds = train_linear_probe(
+        train_random, train_labels,
+        test_random, test_labels,
+        seed,
+    )
+    results.update(lp_metrics)
+
+    # Silhouette score on random embeddings
+    silhouette = calculate_silhouette(test_random, test_labels)
+    results["silhouette_score"] = silhouette
+
+    # PCA visualization of random embeddings
+    pca_path = os.path.join(output_dir, "pca_visualization_random.png")
+    pca_metrics = create_pca_visualization(
+        test_random, test_labels,
+        pca_path,
+        title=f"Random Baseline Embeddings - PCA\n(Silhouette: {silhouette:.3f})",
+    )
+    results.update(pca_metrics)
+
+    # 3-layer NN on random embeddings
+    nn_metrics, _, _, nn_preds = train_three_layer_nn(
+        train_random, train_labels,
+        val_random, val_labels,
+        test_random, test_labels,
+        nn_hidden_dim, nn_epochs, nn_lr,
+        seed, device,
+    )
+    results.update(nn_metrics)
+
+    # Prefix all keys with "random_"
+    random_results = {f"random_{k}": v for k, v in results.items()}
+
+    # Save random predictions
+    predictions = {
+        "linear_probe_preds": lp_preds["test_preds"],
+        "linear_probe_probs": lp_preds["test_probs"],
+        "nn_preds": nn_preds["test_preds"],
+        "nn_probs": nn_preds["test_probs"],
+    }
+
+    return random_results, predictions
+
+
+def calculate_embedding_power(
+    pretrained_metrics: Dict[str, float],
+    random_metrics: Dict[str, float],
+) -> Dict[str, float]:
+    """Compute embedding power = pretrained - random for each metric.
+
+    Returns dict with 'embedding_power_' prefix.
+    """
+    power = {}
+    # Map pretrained keys to random keys
+    for key, value in pretrained_metrics.items():
+        random_key = f"random_{key}"
+        if random_key in random_metrics and isinstance(value, (int, float)):
+            random_value = random_metrics[random_key]
+            if isinstance(random_value, (int, float)):
+                power[f"embedding_power_{key}"] = float(value - random_value)
+    return power
+
+
+def print_embedding_power_summary(
+    pretrained_metrics: Dict[str, float],
+    random_metrics: Dict[str, float],
+    power_metrics: Dict[str, float],
+) -> None:
+    """Print a formatted comparison table of pretrained vs random metrics."""
+    print("\n" + "=" * 60)
+    print("EMBEDDING POWER SUMMARY")
+    print("=" * 60)
+    print(f"{'Metric':<24} {'Pretrained':>10} {'Random':>10} {'Power':>10}")
+    print("-" * 60)
+
+    # Define which metrics to show in the summary table
+    display_metrics = [
+        ("LP Accuracy", "linear_probe_accuracy"),
+        ("LP Precision", "linear_probe_precision"),
+        ("LP Recall", "linear_probe_recall"),
+        ("LP F1", "linear_probe_f1"),
+        ("LP MCC", "linear_probe_mcc"),
+        ("LP AUC", "linear_probe_auc"),
+        ("LP Sensitivity", "linear_probe_sensitivity"),
+        ("LP Specificity", "linear_probe_specificity"),
+        ("NN Accuracy", "nn_accuracy"),
+        ("NN Precision", "nn_precision"),
+        ("NN Recall", "nn_recall"),
+        ("NN F1", "nn_f1"),
+        ("NN MCC", "nn_mcc"),
+        ("NN AUC", "nn_auc"),
+        ("NN Sensitivity", "nn_sensitivity"),
+        ("NN Specificity", "nn_specificity"),
+        ("Silhouette", "silhouette_score"),
+    ]
+
+    for display_name, key in display_metrics:
+        pretrained_val = pretrained_metrics.get(key)
+        random_val = random_metrics.get(f"random_{key}")
+        power_val = power_metrics.get(f"embedding_power_{key}")
+        if pretrained_val is not None and random_val is not None and power_val is not None:
+            sign = "+" if power_val >= 0 else ""
+            print(f"{display_name:<24} {pretrained_val:>10.4f} {random_val:>10.4f} {sign}{power_val:>9.4f}")
+
+    print("=" * 60)
+
+
 def main():
     """Main function to run embedding analysis."""
     args = parse_arguments()
@@ -532,12 +688,20 @@ def main():
     # Load data
     train_df, val_df, test_df = load_csv_data(args.csv_dir)
 
-    # Check if embeddings already exist
-    embeddings_path = os.path.join(args.output_dir, "embeddings.npz")
+    # Check if embeddings already exist (backward compat: try both names)
+    embeddings_path = os.path.join(args.output_dir, "embeddings_pretrained.npz")
+    legacy_path = os.path.join(args.output_dir, "embeddings.npz")
     if os.path.exists(embeddings_path):
-        print(f"\nFound existing embeddings at: {embeddings_path}")
+        load_path = embeddings_path
+    elif os.path.exists(legacy_path):
+        load_path = legacy_path
+    else:
+        load_path = None
+
+    if load_path is not None:
+        print(f"\nFound existing embeddings at: {load_path}")
         print("Loading embeddings from file (delete file to re-extract)...")
-        loaded = np.load(embeddings_path)
+        loaded = np.load(load_path)
         train_embeddings = loaded["train_embeddings"]
         train_labels = loaded["train_labels"]
         val_embeddings = loaded["val_embeddings"]
@@ -588,7 +752,7 @@ def main():
 
         print(f"\nEmbedding shape: {test_embeddings.shape}")
 
-        # Save embeddings
+        # Save embeddings with new name
         np.savez(
             embeddings_path,
             train_embeddings=train_embeddings,
@@ -604,8 +768,8 @@ def main():
         del evo2_model
         torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
-    # Run analyses
-    results = {}
+    # Run pretrained analyses
+    pretrained_results = {}
 
     # 1. Train linear probe
     linear_metrics, linear_preds = train_linear_probe(
@@ -613,20 +777,23 @@ def main():
         test_embeddings, test_labels,
         args.seed,
     )
-    results.update(linear_metrics)
+    pretrained_results.update(linear_metrics)
 
     # 2. Calculate silhouette score
     silhouette = calculate_silhouette(test_embeddings, test_labels)
-    results["silhouette_score"] = silhouette
+    pretrained_results["silhouette_score"] = silhouette
 
     # 3. Create PCA visualization
-    pca_path = os.path.join(args.output_dir, "pca_visualization.png")
+    if args.include_random_baseline:
+        pca_path = os.path.join(args.output_dir, "pca_visualization_pretrained.png")
+    else:
+        pca_path = os.path.join(args.output_dir, "pca_visualization.png")
     pca_metrics = create_pca_visualization(
         test_embeddings, test_labels,
         pca_path,
         title=f"Evo2 ({args.model}) Embeddings - PCA\n(Silhouette: {silhouette:.3f})",
     )
-    results.update(pca_metrics)
+    pretrained_results.update(pca_metrics)
 
     # 4. Train 3-layer NN
     nn_metrics, nn_model, nn_scaler, nn_preds = train_three_layer_nn(
@@ -636,9 +803,9 @@ def main():
         args.nn_hidden_dim, args.nn_epochs, args.nn_lr,
         args.seed, device,
     )
-    results.update(nn_metrics)
+    pretrained_results.update(nn_metrics)
 
-    # 5. Save test predictions to CSV
+    # 5. Save pretrained test predictions to CSV
     predictions_df = pd.DataFrame({
         "sequence": test_df["sequence"].tolist(),
         "label": test_labels,
@@ -647,7 +814,10 @@ def main():
         "nn_pred": nn_preds["test_preds"],
         "nn_prob": nn_preds["test_probs"],
     })
-    predictions_path = os.path.join(args.output_dir, "test_predictions.csv")
+    if args.include_random_baseline:
+        predictions_path = os.path.join(args.output_dir, "test_predictions_pretrained.csv")
+    else:
+        predictions_path = os.path.join(args.output_dir, "test_predictions.csv")
     predictions_df.to_csv(predictions_path, index=False)
     print(f"\nSaved test predictions to: {predictions_path}")
 
@@ -660,6 +830,47 @@ def main():
     }, nn_model_path)
     print(f"Saved 3-layer NN to: {nn_model_path}")
 
+    # Build final results dict
+    results = {}
+
+    # Random baseline evaluation
+    if args.include_random_baseline:
+        # Prefix pretrained metrics
+        for k, v in pretrained_results.items():
+            results[f"pretrained_{k}"] = v
+
+        # Run random baseline
+        hidden_dim = test_embeddings.shape[1]
+        random_results, random_preds = run_random_baseline(
+            train_labels, val_labels, test_labels,
+            hidden_dim, args.seed,
+            args.nn_hidden_dim, args.nn_epochs, args.nn_lr,
+            device, args.output_dir,
+        )
+        results.update(random_results)
+
+        # Save random predictions CSV
+        random_pred_df = pd.DataFrame({
+            "sequence": test_df["sequence"].tolist(),
+            "label": test_labels,
+            "linear_probe_pred": random_preds["linear_probe_preds"],
+            "linear_probe_prob": random_preds["linear_probe_probs"],
+            "nn_pred": random_preds["nn_preds"],
+            "nn_prob": random_preds["nn_probs"],
+        })
+        random_pred_path = os.path.join(args.output_dir, "test_predictions_random.csv")
+        random_pred_df.to_csv(random_pred_path, index=False)
+        print(f"\nSaved random predictions to: {random_pred_path}")
+
+        # Compute embedding power
+        power_metrics = calculate_embedding_power(pretrained_results, random_results)
+        results.update(power_metrics)
+
+        # Print comparison summary
+        print_embedding_power_summary(pretrained_results, random_results, power_metrics)
+    else:
+        results.update(pretrained_results)
+
     # Add metadata to results
     results["model"] = args.model
     results["layer"] = args.layer
@@ -668,6 +879,7 @@ def main():
     results["train_samples"] = len(train_labels)
     results["val_samples"] = len(val_labels)
     results["test_samples"] = len(test_labels)
+    results["include_random_baseline"] = args.include_random_baseline
 
     # Save results
     results_path = os.path.join(args.output_dir, "embedding_analysis_results.json")
@@ -682,17 +894,31 @@ def main():
     print(f"\nModel: {args.model}")
     print(f"Layer: {args.layer}")
     print(f"Embedding dimension: {test_embeddings.shape[1]}")
-    print(f"\nLinear Probe Results:")
-    print(f"  Accuracy: {results['linear_probe_accuracy']:.4f}")
-    print(f"  MCC: {results['linear_probe_mcc']:.4f}")
-    print(f"  AUC: {results['linear_probe_auc']:.4f}")
-    print(f"\n3-Layer NN Results:")
-    print(f"  Accuracy: {results['nn_accuracy']:.4f}")
-    print(f"  MCC: {results['nn_mcc']:.4f}")
-    print(f"  AUC: {results['nn_auc']:.4f}")
-    print(f"\nEmbedding Quality:")
-    print(f"  Silhouette Score: {results['silhouette_score']:.4f}")
-    print(f"  PCA Variance Explained: {results['pca_total_explained_variance']*100:.1f}%")
+
+    if args.include_random_baseline:
+        print(f"\nPretrained Linear Probe Results:")
+        print(f"  Accuracy: {pretrained_results['linear_probe_accuracy']:.4f}")
+        print(f"  MCC: {pretrained_results['linear_probe_mcc']:.4f}")
+        print(f"  AUC: {pretrained_results['linear_probe_auc']:.4f}")
+        print(f"\nPretrained 3-Layer NN Results:")
+        print(f"  Accuracy: {pretrained_results['nn_accuracy']:.4f}")
+        print(f"  MCC: {pretrained_results['nn_mcc']:.4f}")
+        print(f"  AUC: {pretrained_results['nn_auc']:.4f}")
+        print(f"\nPretrained Embedding Quality:")
+        print(f"  Silhouette Score: {pretrained_results['silhouette_score']:.4f}")
+        print(f"  PCA Variance Explained: {pretrained_results['pca_total_explained_variance']*100:.1f}%")
+    else:
+        print(f"\nLinear Probe Results:")
+        print(f"  Accuracy: {pretrained_results['linear_probe_accuracy']:.4f}")
+        print(f"  MCC: {pretrained_results['linear_probe_mcc']:.4f}")
+        print(f"  AUC: {pretrained_results['linear_probe_auc']:.4f}")
+        print(f"\n3-Layer NN Results:")
+        print(f"  Accuracy: {pretrained_results['nn_accuracy']:.4f}")
+        print(f"  MCC: {pretrained_results['nn_mcc']:.4f}")
+        print(f"  AUC: {pretrained_results['nn_auc']:.4f}")
+        print(f"\nEmbedding Quality:")
+        print(f"  Silhouette Score: {pretrained_results['silhouette_score']:.4f}")
+        print(f"  PCA Variance Explained: {pretrained_results['pca_total_explained_variance']*100:.1f}%")
     print("=" * 60)
 
     # Print timing

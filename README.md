@@ -280,6 +280,85 @@ python src/create_categorized_pdfs.py \
     --clustering_results ./clustering_results_best/clustering_results.json
 ```
 
+## Embedding Evaluation
+
+**Script:** `src/evo2_embedding_analysis.py`
+
+Measure the quality of Evo2 embeddings by training downstream classifiers and optionally comparing against a random baseline. This follows the GENERanno evaluation pattern: extract pretrained embeddings, train classifiers, then repeat with random (Gaussian noise) embeddings to compute **embedding power** — the performance gain attributable to the pretrained model.
+
+### Input format
+
+A directory containing `train.csv`, `dev.csv` (or `val.csv`), and `test.csv`. Each CSV must have `sequence` and `label` columns.
+
+### CLI arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--csv_dir` | *(required)* | Directory containing train.csv, dev.csv, test.csv |
+| `--output_dir` | `./results/embedding_analysis` | Output directory |
+| `--model` | `evo2_7b` | Evo2 model (`evo2_7b` or `evo2_40b`) |
+| `--layer` | `blocks.28.mlp.l3` | Layer for embedding extraction |
+| `--pooling` | `mean` | Pooling strategy: `mean`, `first`, `last`, `max` |
+| `--batch_size` | `1` | Batch size for extraction |
+| `--max_length` | none | Maximum sequence length (truncate longer) |
+| `--seed` | `42` | Random seed |
+| `--nn_epochs` | `100` | Training epochs for 3-layer NN |
+| `--nn_hidden_dim` | `256` | Hidden dimension for 3-layer NN |
+| `--nn_lr` | `0.001` | Learning rate for 3-layer NN |
+| `--include_random_baseline` | off | Include random embedding baseline |
+
+### Example
+
+```bash
+# Without random baseline
+python src/evo2_embedding_analysis.py \
+    --csv_dir /path/to/csv/data \
+    --output_dir ./results/embedding_analysis \
+    --model evo2_7b \
+    --layer blocks.28.mlp.l3
+
+# With random baseline (recommended)
+python src/evo2_embedding_analysis.py \
+    --csv_dir /path/to/csv/data \
+    --output_dir ./results/embedding_analysis \
+    --model evo2_7b \
+    --layer blocks.28.mlp.l3 \
+    --include_random_baseline
+```
+
+Or use the wrapper scripts (GENERanno-style three-tier pattern):
+
+```bash
+# 1. Edit configuration in the wrapper script
+vi scripts/wrapper_run_embedding_analysis.sh   # set CSV_DIR, MODEL, etc.
+
+# 2a. Submit as SLURM batch job
+bash scripts/wrapper_run_embedding_analysis.sh
+
+# 2b. Or run interactively on current node
+bash scripts/run_embedding_analysis_interactive.sh
+```
+
+### Output files
+
+| File | Description |
+|------|-------------|
+| `embeddings_pretrained.npz` | Cached pretrained embeddings (train/val/test) |
+| `embedding_analysis_results.json` | All metrics (pretrained, random, embedding power) |
+| `pca_visualization_pretrained.png` | PCA plot of pretrained embeddings |
+| `pca_visualization_random.png` | PCA plot of random embeddings (with `--include_random_baseline`) |
+| `test_predictions_pretrained.csv` | Pretrained model predictions |
+| `test_predictions_random.csv` | Random baseline predictions (with `--include_random_baseline`) |
+| `three_layer_nn.pt` | Trained 3-layer NN classifier |
+
+### Metrics
+
+- **Linear probe**: Logistic regression on embeddings (accuracy, precision, recall, F1, MCC, AUC, sensitivity, specificity)
+- **3-layer NN**: Neural network classifier on embeddings (same metrics)
+- **Silhouette score**: Measures class separation in embedding space
+- **PCA explained variance**: How much variance the first 2 principal components capture
+- **Embedding power** (with `--include_random_baseline`): Difference between pretrained and random metrics — quantifies how much the model's learned representations improve over random noise
+
 ## Reproducing the LAMBDA Benchmark
 
 End-to-end pipeline from raw FASTA files to benchmark results:
@@ -341,10 +420,15 @@ These are nucleotide-level metrics averaged across LAMBDA genomes with ground tr
 │   ├── cluster_activations.py        # Convert activation arrays to predicted prophage regions
 │   ├── generate_lambda_plots.py      # Generate PNG activation plots per genome
 │   ├── analyze_performance_factors.py # Correlate performance with genome stats (GC, size, taxonomy)
-│   └── create_categorized_pdfs.py    # Categorized PDF reports (high/medium/low performance)
+│   ├── create_categorized_pdfs.py    # Categorized PDF reports (high/medium/low performance)
+│   ├── evo2_embedding_extraction.py  # Standalone embedding extraction from Evo2
+│   └── evo2_embedding_analysis.py    # Embedding evaluation with random baseline comparison
 ├── scripts/                          # Bash wrappers & setup
 │   ├── setup.sh                      # Environment setup script
-│   └── run_lambda_batch.sh           # Batch processing wrapper
+│   ├── run_lambda_batch.sh           # Batch processing wrapper
+│   ├── wrapper_run_embedding_analysis.sh    # User config + sbatch submission
+│   ├── run_embedding_analysis.sh            # SLURM batch script
+│   └── run_embedding_analysis_interactive.sh # Interactive (no sbatch) runner
 ├── exploratory/                      # Non-core development & profiling scripts
 ├── experiments/                      # Parameter sweep experiments
 │   └── normalization/                # Normalization & threshold experiments
