@@ -278,6 +278,110 @@ python src/cluster_activations.py \
 
 Output includes BED files per genome, comparison plots, accuracy bins (high/medium/low by F1), and `clustering_results.json`.
 
+## Nucleotide-Level Prophage Evaluation (from Segments)
+
+**Script:** `src/nucleotide_evaluation.py`
+
+When SAE inference is run on overlapping 2 kb segments (from `sae_inference.py --save_activations`), this script stitches the per-segment activation arrays back into genome-wide activation tracks and evaluates prophage detection at nucleotide resolution. This leverages the full per-position activation signal rather than reducing to binary segment labels.
+
+### Pipeline
+
+```
+Segment .npy files ──→ Stitch (MAX pool) ──→ Genome-wide activation track
+                                                      │
+                                    Normalize (optional) → Threshold → Cluster → Merge → Filter
+                                                      │
+                                              Predicted prophage regions
+                                                      │
+Ground truth (prophage_start/end) ──────────────→ Nucleotide-level evaluation
+                                                      │
+                                     Per-genome CSV + Aggregate JSON + BED file + Plots
+```
+
+### Prerequisites
+
+1. Run `sae_inference.py` with `--save_activations` on a segment CSV that includes `seq_id`, `start`, `end`, `prophage_start`, `prophage_end` columns
+2. The activation `.npy` files and the output CSV are inputs to this script
+
+### Input format
+
+The input CSV (output from `sae_inference.py`) must contain:
+
+| Column | Description |
+|--------|-------------|
+| `segment_id` | Unique segment identifier (auto-generated if not in original input) |
+| `seq_id` | Genome/contig identifier |
+| `start` | 0-based start position of segment in genome |
+| `end` | 0-based end position of segment in genome |
+| `prophage_start` | Ground truth prophage start (may be empty) |
+| `prophage_end` | Ground truth prophage end (may be empty) |
+
+### CLI arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--input_csv` | *(required)* | Output CSV from sae_inference.py |
+| `--activations_dir` | *(required)* | Directory with per-segment `.npy` files |
+| `--output_dir` | `./nucleotide_eval_results` | Output directory |
+| `--output_prefix` | `nucleotide_eval` | Prefix for output files |
+| `--feature_idx` | `19746` | SAE feature index (for multi-feature `.npy` files) |
+| `--threshold` | `0.5` | Activation threshold for calling positions |
+| `--normalization` | `none` | Normalization: `none`, `zscore`, `robust_zscore`, `percentile`, `local_baseline`, `minmax`, `quantile` |
+| `--norm_window` | `10000` | Window size for `local_baseline` normalization |
+| `--max_gap` | `100` | Max gap between positions for clustering (bp) |
+| `--merge_distance` | `3000` | Max distance for merging regions (bp) |
+| `--min_region_size` | `1000` | Minimum prophage region size (bp) |
+| `--adaptive_threshold` | off | Use per-genome adaptive threshold |
+| `--adaptive_method` | `mad` | Adaptive threshold method: `mad`, `std`, `percentile` |
+| `--adaptive_k` | `3.0` | Adaptive threshold sensitivity |
+| `--plot` | off | Generate per-genome activation track plots |
+
+### Running with wrapper scripts (recommended)
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/wrapper_run_nucleotide_evaluation.sh` | **Edit this file.** Set paths and parameters, then run to submit a SLURM job. |
+| `scripts/run_nucleotide_evaluation.sh` | SLURM batch script (CPU only, no GPU). Called by the wrapper. |
+| `scripts/run_nucleotide_evaluation_interactive.sh` | Runs directly on the current node (no SLURM). Sources config from the wrapper. |
+
+```bash
+# Option A: Submit as a SLURM batch job
+bash scripts/wrapper_run_nucleotide_evaluation.sh
+
+# Option B: Run interactively
+bash scripts/run_nucleotide_evaluation_interactive.sh
+```
+
+### Running the Python script directly
+
+```bash
+python src/nucleotide_evaluation.py \
+    --input_csv results/sae_results.csv \
+    --activations_dir results/sae_results_activations/ \
+    --output_dir ./nucleotide_eval_results \
+    --threshold 0.5 \
+    --max_gap 100 \
+    --merge_distance 3000 \
+    --min_region_size 1000 \
+    --plot
+```
+
+### Output files
+
+| File | Description |
+|------|-------------|
+| `<prefix>_per_genome.csv` | Per-genome metrics: precision, recall, F1, MCC, Jaccard |
+| `<prefix>_aggregate.json` | Micro and macro-averaged metrics across all genomes |
+| `<prefix>_predicted.bed` | Predicted prophage regions in BED format |
+| `plots/<seq_id>_activation_track.png` | Per-genome activation track with predictions and ground truth (with `--plot`) |
+
+### Key design decisions
+
+- **MAX pooling for overlaps**: In overlap regions between adjacent segments, the maximum activation is kept. This preserves sparse prophage signal — a strong activation in one segment window shouldn't be diluted by the overlap.
+- **Reuses functions from `cluster_activations.py`**: Normalization, clustering, merging, filtering, and metric calculation are imported rather than duplicated.
+- **CPU-only**: No GPU needed — all computation is numpy-based on already-extracted activations.
+- **Both micro and macro averaging**: Micro averages over nucleotides across all genomes; macro averages per-genome metrics.
+
 ## Visualization & PDF Reports
 
 ### Step 1: Generate activation plots
@@ -523,6 +627,7 @@ These are nucleotide-level metrics averaged across LAMBDA genomes with ground tr
 ```
 ├── src/                              # Core pipeline scripts
 │   ├── sae_inference.py              # SAE inference on short DNA segments (CSV in, CSV out)
+│   ├── nucleotide_evaluation.py      # Nucleotide-level prophage evaluation from segment activations
 │   ├── run_lambda_batch.py           # Genome-wide scanning with windowed SAE feature extraction
 │   ├── cluster_activations.py        # Convert activation arrays to predicted prophage regions
 │   ├── generate_lambda_plots.py      # Generate PNG activation plots per genome
@@ -538,6 +643,9 @@ These are nucleotide-level metrics averaged across LAMBDA genomes with ground tr
 │   ├── submit_batch_sae_inference.sh            # SAE inference: submit one job per file
 │   ├── run_sae_inference.sh                     # SAE inference: SLURM single-file script
 │   ├── run_batch_sae_inference_interactive.sh   # SAE inference: interactive batch runner
+│   ├── wrapper_run_nucleotide_evaluation.sh     # Nucleotide eval: user config + submit
+│   ├── run_nucleotide_evaluation.sh             # Nucleotide eval: SLURM batch script (CPU only)
+│   ├── run_nucleotide_evaluation_interactive.sh # Nucleotide eval: interactive runner
 │   ├── wrapper_run_embedding_analysis.sh        # Embedding eval: user config + submit
 │   ├── run_embedding_analysis.sh                # Embedding eval: SLURM batch script
 │   └── run_embedding_analysis_interactive.sh    # Embedding eval: interactive runner

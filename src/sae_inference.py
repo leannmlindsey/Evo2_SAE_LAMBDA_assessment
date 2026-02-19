@@ -5,9 +5,14 @@ Standalone Evo2 SAE inference on short DNA segments.
 Runs SAE feature extraction (default: f/19746 prophage detector) on a CSV
 of ~2kb DNA segments and outputs per-segment activation metrics.
 
-Input CSV columns:  segment_id, sequence, label, source
-Output CSV columns: segment_id, sequence, label, source,
-                    max_activation, mean_activation, fraction_firing, pred_label
+Required input CSV columns: sequence (and optionally segment_id)
+All other input columns are passed through to the output CSV unchanged.
+
+If segment_id is not present in the input, it is auto-generated from
+{seq_id}_{start}_{end} (if those columns exist) or as seg_0, seg_1, etc.
+
+Output CSV columns: segment_id, <all input columns except segment_id and sequence>,
+                    sequence, max_activation, mean_activation, fraction_firing, pred_label
 
 Usage:
     python sae_inference.py \
@@ -193,7 +198,7 @@ def main():
         description="Evo2 SAE inference on short DNA segments"
     )
     parser.add_argument("--input_csv", required=True,
-                        help="Input CSV with columns: segment_id, sequence, label, source")
+                        help="Input CSV with required column: sequence. All other columns are passed through.")
     parser.add_argument("--output", required=True,
                         help="Output CSV path (e.g. results.csv)")
     parser.add_argument("--model", default="evo2_7b",
@@ -220,9 +225,25 @@ def main():
     rows = []
     with open(args.input_csv, 'r') as f:
         reader = csv.DictReader(f)
+        input_columns = list(reader.fieldnames)
         for row in reader:
             rows.append(row)
     print(f"  Loaded {len(rows)} segments")
+    print(f"  Input columns: {input_columns}")
+
+    # Auto-generate segment_id if not present
+    has_segment_id = 'segment_id' in input_columns
+    if not has_segment_id:
+        has_coords = 'seq_id' in input_columns and 'start' in input_columns and 'end' in input_columns
+        for i, row in enumerate(rows):
+            if has_coords:
+                row['segment_id'] = f"{row['seq_id']}_{row['start']}_{row['end']}"
+            else:
+                row['segment_id'] = f"seg_{i}"
+        print(f"  Auto-generated segment_id" + (" from seq_id/start/end" if has_coords else " as seg_N"))
+
+    # Determine passthrough columns (all input columns except segment_id and sequence)
+    passthrough_columns = [c for c in input_columns if c not in ('segment_id', 'sequence')]
 
     # Load model
     print(f"\nLoading Evo2 model ({args.model}) ...")
@@ -251,8 +272,8 @@ def main():
     print(f"\nRunning inference (feature={args.feature_idx}) ...")
     print(f"  Thresholds — max: {args.max_threshold}, mean: {args.mean_threshold}, fraction: {args.fraction_threshold}")
     print(f"  pred_label=1 if ANY threshold is exceeded")
-    output_fields = ['segment_id', 'sequence', 'label', 'source',
-                     'max_activation', 'mean_activation', 'fraction_firing', 'pred_label']
+    computed_fields = ['max_activation', 'mean_activation', 'fraction_firing', 'pred_label']
+    output_fields = ['segment_id'] + passthrough_columns + ['sequence'] + computed_fields
 
     with open(output_path, 'w', newline='') as out_f:
         writer = csv.DictWriter(out_f, fieldnames=output_fields)
@@ -267,16 +288,14 @@ def main():
                 args.max_threshold, args.mean_threshold, args.fraction_threshold
             )
 
-            out_row = {
-                'segment_id': segment_id,
-                'sequence': sequence,
-                'label': row['label'],
-                'source': row['source'],
-                'max_activation': f"{metrics['max_activation']:.6f}",
-                'mean_activation': f"{metrics['mean_activation']:.6f}",
-                'fraction_firing': f"{metrics['fraction_firing']:.6f}",
-                'pred_label': metrics['pred_label'],
-            }
+            out_row = {'segment_id': segment_id, 'sequence': sequence}
+            # Pass through all extra columns
+            for col in passthrough_columns:
+                out_row[col] = row.get(col, '')
+            out_row['max_activation'] = f"{metrics['max_activation']:.6f}"
+            out_row['mean_activation'] = f"{metrics['mean_activation']:.6f}"
+            out_row['fraction_firing'] = f"{metrics['fraction_firing']:.6f}"
+            out_row['pred_label'] = metrics['pred_label']
             writer.writerow(out_row)
 
             if act_dir is not None:
