@@ -43,35 +43,53 @@ from sklearn.metrics import (
 def calculate_metrics(labels, predictions):
     """Calculate classification metrics from ground truth and predictions.
 
+    Handles edge cases: empty arrays, single-class data (all 0s or all 1s).
+
     Args:
         labels: array-like of ground truth labels (0/1)
         predictions: array-like of predicted labels (0/1)
 
     Returns:
-        Dict of metric name -> float value
+        Dict of metric name -> float value, or None if no samples
     """
     labels = np.asarray(labels, dtype=int)
     predictions = np.asarray(predictions, dtype=int)
 
+    if len(labels) == 0:
+        return None
+
+    # Confusion matrix with explicit labels so it always returns 2x2
+    cm = confusion_matrix(labels, predictions, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+
+    # Accuracy is always safe with non-empty arrays
+    acc = float((tp + tn) / len(labels))
+
+    # Precision, recall, F1 — handle single-class gracefully
+    precision = float(tp / (tp + fp)) if (tp + fp) > 0 else 0.0
+    recall = float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0
+    f1 = float(2 * precision * recall / (precision + recall)) if (precision + recall) > 0 else 0.0
+
+    # MCC — returns 0 when undefined (single class)
+    if len(set(labels)) < 2 or len(set(predictions)) < 2:
+        mcc = 0.0
+    else:
+        mcc = float(matthews_corrcoef(labels, predictions))
+
     metrics = {
-        "accuracy": float(accuracy_score(labels, predictions)),
-        "precision": float(precision_score(labels, predictions, zero_division=0)),
-        "recall": float(recall_score(labels, predictions, zero_division=0)),
-        "f1": float(f1_score(labels, predictions, zero_division=0)),
-        "mcc": float(matthews_corrcoef(labels, predictions)),
+        "accuracy": acc,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "mcc": mcc,
+        "fpr": float(fp / (fp + tn)) if (fp + tn) > 0 else 0.0,
+        "fnr": float(fn / (fn + tp)) if (fn + tp) > 0 else 0.0,
+        "tp": int(tp),
+        "tn": int(tn),
+        "fp": int(fp),
+        "fn": int(fn),
+        "total": int(len(labels)),
     }
-
-    # FPR and FNR from confusion matrix
-    tn, fp, fn, tp = confusion_matrix(labels, predictions, labels=[0, 1]).ravel()
-    metrics["fpr"] = float(fp / (fp + tn)) if (fp + tn) > 0 else 0.0
-    metrics["fnr"] = float(fn / (fn + tp)) if (fn + tp) > 0 else 0.0
-
-    # Also store counts for reference
-    metrics["tp"] = int(tp)
-    metrics["tn"] = int(tn)
-    metrics["fp"] = int(fp)
-    metrics["fn"] = int(fn)
-    metrics["total"] = int(len(labels))
 
     return metrics
 
@@ -81,6 +99,11 @@ def print_metrics(metrics, filename=None):
     if filename:
         print(f"\n  File: {filename}")
         print(f"  Samples: {metrics['total']} (TP={metrics['tp']} TN={metrics['tn']} FP={metrics['fp']} FN={metrics['fn']})")
+    # Warn if single-class ground truth
+    if metrics['tp'] + metrics['fn'] == 0:
+        print(f"  NOTE: No positive samples in ground truth (all label=0)")
+    elif metrics['tn'] + metrics['fp'] == 0:
+        print(f"  NOTE: No negative samples in ground truth (all label=1)")
     print(f"  {'Metric':<12} {'Value':>8}")
     print(f"  {'-'*22}")
     print(f"  {'Accuracy':<12} {metrics['accuracy']:>8.4f}")
@@ -110,6 +133,13 @@ def calculate_metrics_from_csv(csv_path, label_col="label", pred_col="pred_label
         return None
     if pred_col not in df.columns:
         print(f"  WARNING: '{pred_col}' column not found in {csv_path}, skipping")
+        return None
+
+    # Drop rows with missing labels or predictions
+    df = df.dropna(subset=[label_col, pred_col])
+
+    if len(df) == 0:
+        print(f"  WARNING: No valid rows in {csv_path}, skipping")
         return None
 
     labels = df[label_col].values
