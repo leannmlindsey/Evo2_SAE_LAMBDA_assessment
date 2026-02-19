@@ -107,6 +107,11 @@ python src/sae_inference.py \
     --batch_size ${BATCH_SIZE} \
     ${SAVE_ACT_FLAG}
 
+# Calculate and display metrics
+if [ -f "${OUTPUT_CSV}" ]; then
+    python src/calculate_metrics.py --input "${OUTPUT_CSV}"
+fi
+
 echo ""
 echo "============================================================"
 echo "Job completed at: $(date)"

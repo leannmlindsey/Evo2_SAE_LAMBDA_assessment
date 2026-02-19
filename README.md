@@ -155,6 +155,28 @@ python src/sae_inference.py \
     --save_activations
 ```
 
+## Classification Metrics
+
+**Script:** `src/calculate_metrics.py`
+
+Calculate accuracy, precision, recall, F1, MCC, FPR, and FNR from any result CSV with `label` and `pred_label` columns. Runs automatically after each file in the batch inference workflow, and can also be run standalone on existing results.
+
+```bash
+# Single file
+python src/calculate_metrics.py --input results.csv
+
+# Multiple files
+python src/calculate_metrics.py --input results1.csv results2.csv
+
+# All result CSVs in a directory (with aggregate metrics across files)
+python src/calculate_metrics.py --input_dir ./output_directory
+
+# Save metrics to JSON
+python src/calculate_metrics.py --input_dir ./output_directory --output_json metrics.json
+```
+
+When multiple files are provided, per-file metrics are printed followed by aggregate metrics across all files.
+
 ## Genome-Wide Scanning
 
 **Script:** `src/run_lambda_batch.py`
@@ -506,6 +528,7 @@ These are nucleotide-level metrics averaged across LAMBDA genomes with ground tr
 │   ├── generate_lambda_plots.py      # Generate PNG activation plots per genome
 │   ├── analyze_performance_factors.py # Correlate performance with genome stats (GC, size, taxonomy)
 │   ├── create_categorized_pdfs.py    # Categorized PDF reports (high/medium/low performance)
+│   ├── calculate_metrics.py          # Classification metrics from result CSVs (standalone + integrated)
 │   ├── evo2_embedding_extraction.py  # Standalone embedding extraction from Evo2
 │   └── evo2_embedding_analysis.py    # Embedding evaluation with random baseline comparison
 ├── scripts/                          # Bash wrappers & setup

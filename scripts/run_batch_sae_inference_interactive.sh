@@ -161,9 +161,22 @@ while IFS= read -r INPUT_CSV || [ -n "${INPUT_CSV}" ]; do
         --batch_size ${BATCH_SIZE} \
         ${SAVE_ACT_FLAG}
 
+    # Calculate and display metrics for this file
+    if [ -f "${OUTPUT_CSV}" ]; then
+        python src/calculate_metrics.py --input "${OUTPUT_CSV}"
+    fi
+
     echo ""
 
 done < "${INPUT_LIST}"
+
+# Aggregate metrics across all result files
+echo "============================================================"
+echo "Aggregate Metrics Across All Files"
+echo "============================================================"
+python src/calculate_metrics.py \
+    --input_dir "${OUTPUT_DIR}" \
+    --output_json "${OUTPUT_DIR}/metrics.json"
 
 echo "============================================================"
 echo "Batch Inference Complete"
