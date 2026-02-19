@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""
+Standalone Evo2 SAE inference on short DNA segments.
+
+Runs SAE feature extraction (default: f/19746 prophage detector) on a CSV
+of ~2kb DNA segments and outputs per-segment activation metrics.
+
+Input CSV columns:  segment_id, sequence, label, source
+Output CSV columns: segment_id, sequence, label, source,
+                    max_activation, mean_activation, fraction_firing, pred_label
+
+Usage:
+    python sae_inference.py \
+        --input_csv gc_control_2k_test.csv \
+        --output gc_control_2k_results.csv \
+        --threshold 0.5 \
+        --save_activations
+"""
+
+import os
+import sys
+import csv
+import argparse
+import torch
+import numpy as np
+from math import prod
+from pathlib import Path
+from tqdm import tqdm
+from huggingface_hub import hf_hub_download
+from evo2 import Evo2
+
+torch.set_grad_enabled(False)
+
+
+# ============================================================
+# Model components (from run_lambda_batch.py)
+# ============================================================
+
+class ModelScope:
+    def __init__(self, model):
+        self.model = model
+        self.hooks = {}
+        self.activations_cache = {}
+        self._build_module_dict()
+
+    def _build_module_dict(self):
+        self._module_dict = {}
+        def recurse(module, prefix=''):
+            for name, child in module.named_children():
+                self._module_dict[prefix + name] = child
+                recurse(child, prefix=prefix + name + '-')
+        recurse(self.model)
+
+    def add_hook(self, hook_fn, module_str, hook_name):
+        module = self._module_dict[module_str]
+        hook_handle = module.register_forward_hook(hook_fn)
+        self.hooks[hook_name] = hook_handle
+
+    def remove_all_hooks(self):
+        for hook_name in list(self.hooks.keys()):
+            self.hooks[hook_name].remove()
+            del self.hooks[hook_name]
+
+    def clear_all_caches(self):
+        for key in self.activations_cache:
+            self.activations_cache[key] = []
+
+
+class BatchTopKTiedSAE(torch.nn.Module):
+    def __init__(self, d_in, d_hidden, k, device, dtype, tiebreaker_epsilon=1e-6):
+        super().__init__()
+        self.d_in = d_in
+        self.d_hidden = d_hidden
+        self.k = k
+        W_mat = torch.randn((d_in, d_hidden))
+        W_mat = 0.1 * W_mat / torch.linalg.norm(W_mat, dim=0, ord=2, keepdim=True)
+        self.W = torch.nn.Parameter(W_mat)
+        self.b_enc = torch.nn.Parameter(torch.zeros(self.d_hidden))
+        self.b_dec = torch.nn.Parameter(torch.zeros(self.d_in))
+        self.tiebreaker_epsilon = tiebreaker_epsilon
+        self.tiebreaker = torch.linspace(0, tiebreaker_epsilon, d_hidden)
+        self.to(device, dtype)
+
+    def encoder_pre(self, x):
+        return x @ self.W + self.b_enc
+
+    def encode(self, x, tiebreak=False):
+        f = torch.nn.functional.relu(self.encoder_pre(x))
+        return self._batch_topk(f, self.k, tiebreak=tiebreak)
+
+    def _batch_topk(self, f, k, tiebreak=False):
+        if tiebreak:
+            f = f + self.tiebreaker.to(f.device).broadcast_to(f.shape)
+        *input_shape, _ = f.shape
+        numel = k * prod(input_shape)
+        f_flat = f.flatten().float()
+        f_topk = torch.topk(f_flat, numel, dim=-1)
+        result = torch.zeros_like(f_flat).scatter(-1, f_topk.indices, f_topk.values)
+        return result.reshape(f.shape).to(f.dtype)
+
+    def decode(self, f):
+        return f @ self.W.T + self.b_dec
+
+
+def load_topk_sae(sae_path, d_hidden, device, dtype, expansion_factor=8):
+    sae_dict = torch.load(sae_path, weights_only=True, map_location="cpu")
+    new_dict = {k.replace("_orig_mod.", "").replace("module.", ""): v for k, v in sae_dict.items()}
+    cached_sae = BatchTopKTiedSAE(d_hidden, d_hidden * expansion_factor, 64, device, dtype)
+    cached_sae.load_state_dict(new_dict)
+    return cached_sae
+
+
+class ObservableEvo2:
+    def __init__(self, model_name):
+        self.evo_model = Evo2(model_name)
+        self.scope = ModelScope(self.evo_model.model)
+        self.tokenizer = self.evo_model.tokenizer
+        self.model = self.evo_model.model
+        self.d_hidden = 4096
+
+    @property
+    def device(self):
+        return next(self.evo_model.model.parameters()).device
+
+    def forward(self, toks, cache_activations_at=None):
+        if not cache_activations_at:
+            cache_activations_at = []
+        output_cache = {}
+
+        for layer in cache_activations_at:
+            def _intervene(model, input, output, layer=layer):
+                acts = output[0] if isinstance(output, tuple) else output
+                output_cache[layer] = acts.detach()
+                return (acts, output[1]) if isinstance(output, tuple) else acts
+            self.scope.add_hook(_intervene, layer, f'intervene-{layer}')
+
+        try:
+            model_outputs = self.model(toks)
+            cached_activations = {layer: act.clone() for layer, act in output_cache.items()}
+        finally:
+            self.scope.remove_all_hooks()
+            self.scope.clear_all_caches()
+
+        return model_outputs[0], cached_activations
+
+
+SAE_LAYER_NAME = 'blocks-26'
+
+
+def get_feature_ts(model, sae, seq):
+    """Extract feature activations for a sequence."""
+    toks = model.tokenizer.tokenize(seq)
+    toks = torch.tensor(toks, dtype=torch.long).unsqueeze(0).to(model.device)
+    logits, acts = model.forward(toks, cache_activations_at=[SAE_LAYER_NAME])
+    feats = sae.encode(acts[SAE_LAYER_NAME][0])
+    return feats.cpu().detach().float().numpy()
+
+
+# ============================================================
+# Inference
+# ============================================================
+
+def process_segment(model, sae, sequence, feature_idx,
+                    max_threshold, mean_threshold, fraction_threshold):
+    """Run SAE inference on a single segment and return activation metrics.
+
+    pred_label is 1 if ANY of the following conditions is met:
+      - max_activation > max_threshold
+      - mean_activation > mean_threshold
+      - fraction_firing > fraction_threshold
+    """
+    feats = get_feature_ts(model, sae, sequence)
+    activations = feats[:, feature_idx]
+
+    max_act = float(activations.max())
+    mean_act = float(activations.mean())
+    fraction = float((activations > 0).sum() / len(activations)) if len(activations) > 0 else 0.0
+
+    pred_label = 1 if (max_act > max_threshold
+                       or mean_act > mean_threshold
+                       or fraction > fraction_threshold) else 0
+
+    return {
+        'max_activation': max_act,
+        'mean_activation': mean_act,
+        'fraction_firing': fraction,
+        'pred_label': pred_label,
+    }, activations
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Evo2 SAE inference on short DNA segments"
+    )
+    parser.add_argument("--input_csv", required=True,
+                        help="Input CSV with columns: segment_id, sequence, label, source")
+    parser.add_argument("--output", required=True,
+                        help="Output CSV path (e.g. results.csv)")
+    parser.add_argument("--model", default="evo2_7b",
+                        help="Evo2 model name (default: evo2_7b)")
+    parser.add_argument("--feature_idx", type=int, default=19746,
+                        help="SAE feature index (default: 19746)")
+    parser.add_argument("--max_threshold", type=float, default=0.5,
+                        help="Max activation threshold for pred_label (default: 0.5)")
+    parser.add_argument("--mean_threshold", type=float, default=0.1,
+                        help="Mean activation threshold for pred_label (default: 0.1)")
+    parser.add_argument("--fraction_threshold", type=float, default=0.3,
+                        help="Fraction firing threshold for pred_label (default: 0.3)")
+    parser.add_argument("--save_activations", action="store_true",
+                        help="Save per-segment .npy activation arrays")
+    parser.add_argument("--batch_size", type=int, default=1,
+                        help="Batch size (default: 1, reserved for future use)")
+    args = parser.parse_args()
+
+    output_path = Path(args.output)
+    output_prefix = output_path.stem
+
+    # Read input CSV
+    print(f"Reading {args.input_csv} ...")
+    rows = []
+    with open(args.input_csv, 'r') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(row)
+    print(f"  Loaded {len(rows)} segments")
+
+    # Load model
+    print(f"\nLoading Evo2 model ({args.model}) ...")
+    model = ObservableEvo2(model_name=args.model)
+    print(f"  Device: {model.device}")
+
+    # Load SAE
+    print("Loading SAE ...")
+    sae_path = hf_hub_download(
+        repo_id="Goodfire/Evo-2-Layer-26-Mixed",
+        filename="sae-layer26-mixed-expansion_8-k_64.pt",
+        repo_type="model"
+    )
+    sae = load_topk_sae(sae_path, d_hidden=model.d_hidden, device=model.device,
+                        dtype=torch.bfloat16, expansion_factor=8)
+    print(f"  SAE loaded: d_in={sae.d_in}, d_hidden={sae.d_hidden}")
+
+    # Prepare activations directory
+    act_dir = None
+    if args.save_activations:
+        act_dir = output_path.parent / f"{output_prefix}_activations"
+        act_dir.mkdir(parents=True, exist_ok=True)
+        print(f"  Activation arrays will be saved to {act_dir}/")
+
+    # Process segments
+    print(f"\nRunning inference (feature={args.feature_idx}) ...")
+    print(f"  Thresholds — max: {args.max_threshold}, mean: {args.mean_threshold}, fraction: {args.fraction_threshold}")
+    print(f"  pred_label=1 if ANY threshold is exceeded")
+    output_fields = ['segment_id', 'sequence', 'label', 'source',
+                     'max_activation', 'mean_activation', 'fraction_firing', 'pred_label']
+
+    with open(output_path, 'w', newline='') as out_f:
+        writer = csv.DictWriter(out_f, fieldnames=output_fields)
+        writer.writeheader()
+
+        for row in tqdm(rows, desc="Segments"):
+            segment_id = row['segment_id']
+            sequence = row['sequence']
+
+            metrics, activations = process_segment(
+                model, sae, sequence, args.feature_idx,
+                args.max_threshold, args.mean_threshold, args.fraction_threshold
+            )
+
+            out_row = {
+                'segment_id': segment_id,
+                'sequence': sequence,
+                'label': row['label'],
+                'source': row['source'],
+                'max_activation': f"{metrics['max_activation']:.6f}",
+                'mean_activation': f"{metrics['mean_activation']:.6f}",
+                'fraction_firing': f"{metrics['fraction_firing']:.6f}",
+                'pred_label': metrics['pred_label'],
+            }
+            writer.writerow(out_row)
+
+            if act_dir is not None:
+                np.save(act_dir / f"{segment_id}.npy", activations)
+
+    print(f"\nResults written to {output_path}")
+    if act_dir is not None:
+        print(f"Activation arrays saved to {act_dir}/")
+    print("Done!")
+
+
+if __name__ == "__main__":
+    main()

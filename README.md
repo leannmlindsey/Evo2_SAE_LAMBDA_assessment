@@ -1,229 +1,352 @@
-# Evo2 SAE Analysis - Prophage Detection & Embedding Extraction
+# Evo2 SAE Prophage Detection
 
-## Your Setup
-- 8x H200 GPUs (Hopper architecture)
-- No SLURM (direct execution)
+Detect prophage regions in bacterial genomes using a Sparse Autoencoder (SAE) trained on Evo2's internal representations. A single SAE feature (f/19746) activates specifically on prophage sequences, enabling genome-wide prophage scanning without any task-specific training. This repository provides scripts for inference on short segments, genome-wide scanning with windowed processing, post-processing activations into predicted regions, and visualization/benchmarking against the LAMBDA ground truth dataset.
 
-## Available Scripts
+## Background: Sparse Autoencoders (SAEs)
 
-### SAE-based Prophage Detection
-- `run_lambda_batch.py` - Batch process LAMBDA genomes with SAE feature f/19746
-- `visualize_prophage_feature.py` - Visualize prophage feature activations
-- `prophage_detection.py` - Prophage detection using SAE features
+Sparse Autoencoders are a mechanistic interpretability technique that extract interpretable features from neural network internals. An SAE is trained on a model's hidden activations to learn a sparse overcomplete dictionary of features, where each feature corresponds to a specific concept the model has learned.
 
-### Embedding Extraction (GENERanno-style)
-- `evo2_embedding_extraction.py` - Extract embeddings from Evo2 for sequences
-- `evo2_embedding_analysis.py` - Full embedding analysis (linear probe, PCA, 3-layer NN)
-- `evo2_inference.py` - Run inference with trained classifiers
+The SAE used here was trained by [Goodfire](https://goodfire.ai) on [Evo2](https://github.com/ArcInstitute/evo2) (Arc Institute), a 7-billion-parameter DNA language model. Among the 32,768 learned features, **feature f/19746 activates specifically on prophage sequences** — viral DNA integrated into bacterial genomes.
 
-## Step-by-Step Instructions
+**SAE Architecture:**
 
-### 1. Setup Environment (one-time)
+| Property | Value |
+|----------|-------|
+| Type | BatchTopK tied-weight SAE |
+| Input dimension | 4,096 (Evo2 hidden dimension) |
+| SAE dimension | 32,768 (8x expansion) |
+| TopK | 64 (only top 64 features active per position) |
+| Hook location | Layer 26 (`blocks-26`) |
+| HuggingFace repo | [`Goodfire/Evo-2-Layer-26-Mixed`](https://huggingface.co/Goodfire/Evo-2-Layer-26-Mixed) |
+| Weights file | `sae-layer26-mixed-expansion_8-k_64.pt` |
+
+The extraction process is:
+1. Tokenize a DNA sequence with Evo2's tokenizer
+2. Forward pass through Evo2, capturing hidden states at layer 26 via PyTorch hooks
+3. Encode the layer-26 activations through the SAE: `features = sae.encode(hidden_states)`
+4. Extract prophage feature: `prophage_signal = features[:, 19746]`
+
+## Setup & Dependencies
+
+### Evo2 (GPU inference)
+
+Evo2 must be installed for running inference. Follow the instructions at [github.com/ArcInstitute/evo2](https://github.com/ArcInstitute/evo2). SAE weights are downloaded automatically from HuggingFace on first run via `huggingface_hub`.
+
+Key dependencies for inference:
+- `torch`
+- `evo2`
+- `huggingface_hub`
+- `numpy`
+- `tqdm`
+
+### Analysis-only environment (no GPU)
+
+For post-processing, clustering, visualization, and PDF report generation (no GPU required):
 
 ```bash
-# SSH to your node
-ssh your-h200-node
-
-# Clone this repo or copy the scripts
-mkdir ~/evo2_prophage && cd ~/evo2_prophage
-
-# Run setup (takes ~10-15 minutes)
-bash setup_evo2_h200.sh
-```
-
-### 2. Inspect SAE Checkpoint (important!)
-
-Before running detection, we need to understand the SAE format:
-
-```bash
+conda env create -f environment.yml
 conda activate evo2-sae
-python inspect_sae_checkpoint.py
 ```
 
-This will show you:
-- The exact file format and keys in the SAE checkpoint
-- The correct layer names in Evo2 for extracting embeddings
-- Any necessary updates to the detection script
+This installs: `numpy`, `pandas`, `matplotlib`, `scikit-learn`, `scipy`, `tqdm`, `pillow` (Python 3.10).
 
-### 3. Test on E. coli First
+## Quick Start: Inference on Short Segments
 
-Download E. coli K12 MG1655 (the genome from the paper):
+**Script:** `sae_inference.py`
+
+Run SAE feature extraction on a CSV of short (~2 kb) DNA segments and get per-segment activation metrics.
+
+### Input CSV format
+
+| Column | Description |
+|--------|-------------|
+| `segment_id` | Unique identifier for each segment |
+| `sequence` | DNA sequence string |
+| `label` | Ground truth label (1 = prophage, 0 = non-prophage) |
+| `source` | Source annotation |
+
+### Output CSV columns
+
+The input columns are preserved, with these columns appended:
+
+| Column | Description |
+|--------|-------------|
+| `max_activation` | Maximum SAE activation across all positions |
+| `mean_activation` | Mean SAE activation across all positions |
+| `fraction_firing` | Fraction of positions with activation > 0 |
+| `pred_label` | Predicted label (0 or 1) |
+
+**Prediction logic:** `pred_label = 1` if **ANY** of the following conditions is met:
+- `max_activation > max_threshold`
+- `mean_activation > mean_threshold`
+- `fraction_firing > fraction_threshold`
+
+### CLI arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--input_csv` | *(required)* | Input CSV with columns: segment_id, sequence, label, source |
+| `--output` | *(required)* | Output CSV path |
+| `--model` | `evo2_7b` | Evo2 model name (`evo2_7b` or `evo2_40b`) |
+| `--feature_idx` | `19746` | SAE feature index |
+| `--max_threshold` | `0.5` | Max activation threshold for pred_label |
+| `--mean_threshold` | `0.1` | Mean activation threshold for pred_label |
+| `--fraction_threshold` | `0.3` | Fraction firing threshold for pred_label |
+| `--save_activations` | off | Save per-segment `.npy` activation arrays |
+| `--batch_size` | `1` | Batch size (reserved for future use) |
+
+### Example
 
 ```bash
-# Download E. coli K12 MG1655 reference
-mkdir -p ~/test_genomes
-cd ~/test_genomes
-wget https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/005/845/GCF_000005845.2_ASM584v2/GCF_000005845.2_ASM584v2_genomic.fna.gz
-gunzip GCF_000005845.2_ASM584v2_genomic.fna.gz
-mv GCF_000005845.2_ASM584v2_genomic.fna ecoli_k12_mg1655.fasta
-```
-
-Run detection:
-
-```bash
-cd ~/evo2_prophage
-python run_prophage_detection.py \
-    --genome_dir ~/test_genomes \
-    --output_dir ~/test_results \
-    --device cuda:0 \
+python sae_inference.py \
+    --input_csv gc_control_2k_test.csv \
+    --output gc_control_2k_results.csv \
+    --max_threshold 0.5 \
     --save_activations
 ```
 
-Expected output for E. coli K12:
-- Should detect ~9 cryptic prophage regions
-- Known prophages: CP4-6, DLP12, e14, rac, Qin, CP4-44, CPS-53, CPZ-55, CP4-57
+## Genome-Wide Scanning
 
-### 4. Run on Your 80 Genome Test Set
+**Script:** `run_lambda_batch.py`
 
-```bash
-# Put your genomes in a directory
-ls /path/to/your/bacterial_genomes/
-# genome1.fasta genome2.fasta ...
+Process full bacterial genomes (~1-10 Mb) by sliding a window across the genome and extracting SAE feature activations at each position.
 
-# Create ground truth BED file (if you have annotations)
-# Format: chrom<TAB>start<TAB>end<TAB>name
-# Example:
-# CP000948.1    123456    167890    prophage_1
-# CP000948.1    234567    289012    prophage_2
+### Windowing strategy
 
-# Run detection with evaluation
-python run_prophage_detection.py \
-    --genome_dir /path/to/your/bacterial_genomes \
-    --output_dir ~/prophage_results \
-    --ground_truth /path/to/ground_truth.bed \
-    --threshold 0.5 \
-    --min_length 5000 \
-    --save_activations
-```
+- **Window size:** 50,000 bp (default)
+- **Overlap:** 1,000 bp between adjacent windows
+- **Stride:** 49,000 bp (window_size - overlap)
+- **Startup trim:** First 10 positions of each window (except the first) are zeroed to remove model startup artifacts
+- **Overlap resolution:** MAX pooling — in overlap regions, the maximum activation from either window is kept, preserving the sparse prophage signal
 
-### 5. Multi-GPU Processing (Optional)
+### Output
 
-For 80 genomes, you can parallelize across your 8 GPUs:
+| File | Description |
+|------|-------------|
+| `<assembly_id>_activations.npy` | Per-position activation array for each genome |
+| `all_results.json` | Detailed per-genome results with region stats |
+| `summary.csv` | Summary table (assembly, sequence_length, ground_truth_count, total_firing, max_activation, fraction_in_gt) |
 
-```bash
-# Split genomes into 8 batches
-ls /path/to/genomes/*.fasta | split -n l/8 - genome_batch_
+### CLI arguments
 
-# Run in parallel (in separate terminals or using GNU parallel)
-for i in {0..7}; do
-    python run_prophage_detection.py \
-        --genome_dir /path/to/genomes \
-        --output_dir ~/results_gpu${i} \
-        --device cuda:${i} \
-        --genome_list genome_batch_a${i} &  # Note: you'd need to implement --genome_list
-done
-wait
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--fasta_dir` | *(required)* | Directory containing FASTA files (`.fna` or `.fasta`) |
+| `--ground_truth` | *(required)* | Ground truth CSV file |
+| `--output_dir` | `./lambda_results` | Output directory |
+| `--model` | `evo2_7b` | Evo2 model name |
+| `--window_size` | `50000` | Window size for processing |
+| `--startup_trim` | `10` | Positions to trim from window start to remove artifacts |
 
-# Merge results
-cat ~/results_gpu*/prophage_predictions.csv > ~/all_predictions.csv
-```
-
-## Output Files
-
-```
-prophage_results/
-├── config.json                  # Run configuration
-├── prophage_predictions.csv     # Main results table
-├── prophage_predictions.bed     # For genome browsers
-├── prophage_predictions.gff3    # For annotation tools
-├── evaluation_metrics.json      # Metrics vs ground truth
-└── *_activations.npy           # Raw activation arrays
-```
-
-## Troubleshooting
-
-### "Could not find encoder weights"
-Run `inspect_sae_checkpoint.py` and update the `SAEModule.from_pretrained()` method with the correct key names.
-
-### "Could not extract embeddings"
-The layer name might be different. Check the output of `inspect_sae_checkpoint.py` for available layer names.
-
-### Out of memory
-- Reduce `window_size` in the config (default: 8192)
-- Use `evo2_7b` instead of `evo2_40b`
-
-
-
----
-
-## Embedding Extraction & Analysis (GENERanno-style)
-
-These scripts follow the same workflow as GENERanno for downstream task evaluation.
-
-### 1. Extract Embeddings
+### Example
 
 ```bash
-# Extract embeddings from a single CSV file
-python evo2_embedding_extraction.py \
-    --input_csv /path/to/sequences.csv \
-    --output_dir ./embeddings \
-    --model evo2_7b \
-    --layer blocks.28.mlp.l3 \
-    --pooling mean
+python run_lambda_batch.py \
+    --fasta_dir /path/to/LAMBDA/FASTA \
+    --ground_truth /path/to/Lambda_Genome_Wide_Evaluation_Test_Set.csv \
+    --output_dir ./lambda_results_7b
 ```
 
-Input CSV format:
-```csv
-sequence,label
-ATCGATCG...,1
-GCTAGCTA...,0
-```
+## Post-Processing: Activations to Predicted Regions
 
-### 2. Full Embedding Analysis
+**Script:** `cluster_activations.py`
+
+Convert per-position SAE activation arrays into discrete predicted prophage regions using a pipeline of normalize, threshold, cluster, filter, and merge.
+
+### Pipeline
+
+1. **Normalize** — z-score normalization: `(x - mean) / std` per genome
+2. **Threshold** — select positions with normalized activation > threshold
+3. **Cluster** — group nearby above-threshold positions (max_gap parameter)
+4. **Filter** — remove regions smaller than min_region_size
+5. **Merge** — combine regions within merge_distance of each other
+
+### Best parameters (from optimization)
+
+| Parameter | Value |
+|-----------|-------|
+| Normalization | z-score (`--normalize zscore`) |
+| Threshold | 7.0 (`--threshold 7.0`) |
+| Max gap | 300 bp (`--max_gap 300`) |
+| Merge distance | 5,000 bp (`--merge_distance 5000`) |
+| Min region size | 1,000 bp (`--min_region_size 1000`) |
+
+### CLI arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--results_dir` | *(required)* | Directory with `*_activations.npy` files |
+| `--ground_truth` | *(required)* | Ground truth CSV file |
+| `--output_dir` | `./cluster_results` | Output directory |
+| `--threshold` | `0.3` | Activation threshold |
+| `--normalize` | `none` | Normalization method: `none`, `zscore`, `robust_zscore`, `percentile`, `local_baseline`, `minmax`, `quantile` |
+| `--norm_window` | `10000` | Window size for `local_baseline` normalization |
+| `--max_gap` | `100` | Max gap between positions in simple clustering (bp) |
+| `--min_region_size` | `1000` | Minimum region size (bp) |
+| `--merge_distance` | `3000` | Merge regions within this distance (bp) |
+| `--use_hdbscan` | off | Also run HDBSCAN clustering |
+| `--use_optics` | off | Also run OPTICS clustering |
+| `--use_mws` | off | Use Moving Window Sum algorithm |
+| `--fix_artifacts` | off | Fix window boundary artifacts before clustering |
+| `--no_plots` | off | Skip generating plots |
+
+### Example (best parameters)
 
 ```bash
-# Run complete analysis pipeline (linear probe, PCA, 3-layer NN)
-python evo2_embedding_analysis.py \
-    --csv_dir /path/to/data \
-    --output_dir ./results \
-    --model evo2_7b \
-    --layer blocks.28.mlp.l3 \
-    --pooling mean
+python cluster_activations.py \
+    --results_dir ./lambda_results_7b \
+    --ground_truth /path/to/Lambda_Genome_Wide_Evaluation_Test_Set.csv \
+    --output_dir ./clustering_results_best \
+    --normalize zscore \
+    --threshold 7.0 \
+    --max_gap 300 \
+    --merge_distance 5000 \
+    --min_region_size 1000
 ```
 
-The `csv_dir` should contain:
-- `train.csv`
-- `dev.csv` (or `val.csv`)
-- `test.csv`
+Output includes BED files per genome, comparison plots, accuracy bins (high/medium/low by F1), and `clustering_results.json`.
 
-Output files:
-- `embeddings.npz` - Cached embeddings
-- `embedding_analysis_results.json` - All metrics
-- `pca_visualization.png` - PCA plot
-- `test_predictions.csv` - Test set predictions
-- `three_layer_nn.pt` - Trained classifier
+## Visualization & PDF Reports
 
-### 3. Inference with Trained Classifier
+### Step 1: Generate activation plots
+
+**Script:** `generate_lambda_plots.py`
+
+Creates PNG plots from `.npy` activation files overlaid with ground truth prophage regions.
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--results_dir` | *(required)* | Directory containing `*_activations.npy` files |
+| `--ground_truth` | *(required)* | Ground truth CSV file |
+| `--output_dir` | `<results_dir>/plots` | Output directory for plots |
+| `--threshold` | `0.5` | Activation threshold for highlighting |
+| `--dpi` | `150` | DPI for output images |
 
 ```bash
-# Using pre-trained 3-layer NN
-python evo2_inference.py \
-    --input_csv /path/to/test.csv \
-    --classifier_path ./results/three_layer_nn.pt \
-    --output_csv predictions.csv \
-    --save_metrics
+python generate_lambda_plots.py \
+    --results_dir ./lambda_results_7b \
+    --ground_truth /path/to/Lambda_Genome_Wide_Evaluation_Test_Set.csv \
+    --output_dir ./lambda_plots
 ```
 
-### Available Layers for Embedding Extraction
+### Step 2: Analyze performance factors
 
-Common layer names for Evo2 7B:
-- `blocks.28.mlp.l3` - MLP output at layer 28 (recommended)
-- `blocks.26` - Full layer 26 output (used for SAE)
-- `blocks.{N}.mlp.l3` - MLP output at any layer N
+**Script:** `analyze_performance_factors.py`
 
-### Or Use the Pipeline Script
+Computes per-genome statistics (GC content, genome size, taxonomy) and correlates them with detection performance (F1, precision, recall, MCC). Generates comparison plots and a `genome_stats.csv`.
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--clustering_results` | *(required)* | Path to `clustering_results.json` |
+| `--ground_truth` | *(required)* | Ground truth CSV file |
+| `--fasta_dir` | *(required)* | Directory containing FASTA files |
+| `--output_dir` | `./performance_analysis` | Output directory |
 
 ```bash
-./run_evo2_embedding_pipeline.sh \
-    --csv_dir /path/to/data \
-    --model evo2_7b \
-    --layer blocks.28.mlp.l3 \
-    --output_dir ./results
+python analyze_performance_factors.py \
+    --clustering_results ./clustering_results_best/clustering_results.json \
+    --ground_truth /path/to/Lambda_Genome_Wide_Evaluation_Test_Set.csv \
+    --fasta_dir /path/to/LAMBDA/FASTA \
+    --output_dir ./performance_analysis
 ```
 
----
+### Step 3: Create categorized PDF reports
 
-## Questions?
+**Script:** `create_categorized_pdfs.py`
 
-- Evo2 issues: https://github.com/ArcInstitute/evo2/issues
-- SAE/Goodfire: https://goodfire.ai
+Generates categorized PDF reports (high, medium, low performance) with plots arranged 3 per page. Can use genome stats for full annotations or work standalone with plot summaries.
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--plots_dir` | *(required)* | Directory containing plot PNG files |
+| `--genome_stats` | — | `genome_stats.csv` from `analyze_performance_factors.py` (preferred) |
+| `--summary_json` | — | `plot_summary.json` or `clustering_results.json` (fallback) |
+| `--clustering_results` | — | `clustering_results.json` for P/R/MCC metrics |
+| `--ground_truth` | — | Ground truth CSV for taxonomy |
+| `--fasta_dir` | — | FASTA directory for GC calculation |
+| `--output_dir` | `./categorized_pdfs` | Output directory |
+| `--high_thresh` | `0.7` | Threshold for high performance |
+| `--low_thresh` | `0.3` | Threshold for low performance |
+
+```bash
+# With full stats (preferred)
+python create_categorized_pdfs.py \
+    --plots_dir ./clustering_results_best/plots \
+    --genome_stats ./performance_analysis/genome_stats.csv
+
+# Standalone with clustering results
+python create_categorized_pdfs.py \
+    --plots_dir ./clustering_results_best/plots \
+    --clustering_results ./clustering_results_best/clustering_results.json
+```
+
+## Reproducing the LAMBDA Benchmark
+
+End-to-end pipeline from raw FASTA files to benchmark results:
+
+```bash
+# Step 1: Genome-wide scanning (requires GPU + Evo2)
+python run_lambda_batch.py \
+    --fasta_dir /path/to/LAMBDA/FASTA \
+    --ground_truth /path/to/Lambda_Genome_Wide_Evaluation_Test_Set.csv \
+    --output_dir ./lambda_results_7b
+
+# Step 2: Cluster activations into predicted regions (CPU only)
+python cluster_activations.py \
+    --results_dir ./lambda_results_7b \
+    --ground_truth /path/to/Lambda_Genome_Wide_Evaluation_Test_Set.csv \
+    --output_dir ./clustering_results_best \
+    --normalize zscore \
+    --threshold 7.0 \
+    --max_gap 300 \
+    --merge_distance 5000 \
+    --min_region_size 1000
+
+# Step 3: Generate plots (CPU only)
+python generate_lambda_plots.py \
+    --results_dir ./lambda_results_7b \
+    --ground_truth /path/to/Lambda_Genome_Wide_Evaluation_Test_Set.csv \
+    --output_dir ./lambda_plots
+
+# Step 4: Analyze performance factors (CPU only)
+python analyze_performance_factors.py \
+    --clustering_results ./clustering_results_best/clustering_results.json \
+    --ground_truth /path/to/Lambda_Genome_Wide_Evaluation_Test_Set.csv \
+    --fasta_dir /path/to/LAMBDA/FASTA \
+    --output_dir ./performance_analysis
+
+# Step 5: Create PDF reports (CPU only)
+python create_categorized_pdfs.py \
+    --plots_dir ./clustering_results_best/plots \
+    --genome_stats ./performance_analysis/genome_stats.csv \
+    --output_dir ./categorized_pdfs
+```
+
+### Expected results
+
+| Metric | Value |
+|--------|-------|
+| MCC | 0.599 |
+| Precision | 71.9% |
+| Recall | 52.0% |
+
+These are nucleotide-level metrics averaged across LAMBDA genomes with ground truth, using the best parameters (z-score normalization, threshold 7.0, max_gap 300, merge_distance 5000, min_region_size 1000).
+
+## Repository Structure
+
+| File | Description |
+|------|-------------|
+| `sae_inference.py` | SAE inference on short DNA segments (CSV in, CSV out) |
+| `run_lambda_batch.py` | Genome-wide scanning with windowed SAE feature extraction |
+| `cluster_activations.py` | Convert activation arrays to predicted prophage regions |
+| `generate_lambda_plots.py` | Generate PNG activation plots per genome |
+| `analyze_performance_factors.py` | Correlate performance with genome stats (GC, size, taxonomy) |
+| `create_categorized_pdfs.py` | Categorized PDF reports (high/medium/low performance) |
+| `environment.yml` | Conda environment for analysis-only (no GPU) |
+| `METHODS_SUMMARY.md` | Technical summary of the SAE extraction and post-processing methods |
+
+## References & Links
+
+- **Evo2** — Arc Institute: [github.com/ArcInstitute/evo2](https://github.com/ArcInstitute/evo2)
+- **SAE weights** — Goodfire: [huggingface.co/Goodfire/Evo-2-Layer-26-Mixed](https://huggingface.co/Goodfire/Evo-2-Layer-26-Mixed)
+- **LAMBDA dataset** — Genome-wide prophage evaluation benchmark, Lindsey et al. 2026 (in preparation)
