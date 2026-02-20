@@ -541,16 +541,24 @@ def randomize_model_weights(model, seed: int = 0) -> None:
     torch.manual_seed(seed)
     pytorch_model = model.model if hasattr(model, 'model') else model
     n_params = 0
+    n_norm = 0
+    norm_keywords = ('norm', 'ln', 'scale', 'gain', 'rmsnorm', 'layernorm')
     for name, param in pytorch_model.named_parameters():
         with torch.no_grad():
             if param.dim() >= 2:
                 # Xavier uniform for weight matrices
                 torch.nn.init.xavier_uniform_(param)
             elif param.dim() == 1:
-                # Zero-initialize biases and 1D params
-                torch.nn.init.zeros_(param)
+                # Norm scale/gain params must be initialized to 1, not 0.
+                # Zeroing them collapses all representations to zero vectors.
+                name_lower = name.lower()
+                if any(kw in name_lower for kw in norm_keywords):
+                    torch.nn.init.ones_(param)
+                    n_norm += param.numel()
+                else:
+                    torch.nn.init.zeros_(param)
         n_params += param.numel()
-    print(f"  Randomized {n_params:,} parameters")
+    print(f"  Randomized {n_params:,} parameters ({n_norm:,} norm params set to 1.0)")
 
 
 def run_random_baseline(
