@@ -40,6 +40,11 @@ export NN_EPOCHS="100"
 export NN_HIDDEN_DIM="256"
 export NN_LR="0.001"
 
+# === OPTIONAL: Pre-extracted Embeddings ===
+# Path to pre-extracted pretrained embeddings (.npz file). If set, skips model
+# loading and embedding extraction. Still trains linear probe and NN on them.
+export PRETRAINED_EMBEDDINGS=""
+
 # === OPTIONAL: Include Random Baseline ===
 # Set to "true" to also run analysis on random embeddings for comparison
 export INCLUDE_RANDOM_BASELINE="true"
@@ -104,6 +109,7 @@ echo "  Epochs: ${NN_EPOCHS}"
 echo "  Hidden dim: ${NN_HIDDEN_DIM}"
 echo "  Learning rate: ${NN_LR}"
 echo ""
+echo "Pretrained embeddings: ${PRETRAINED_EMBEDDINGS:-none}"
 echo "Include random baseline: ${INCLUDE_RANDOM_BASELINE}"
 echo "=========================================="
 

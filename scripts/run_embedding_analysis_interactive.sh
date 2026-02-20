@@ -74,6 +74,7 @@ NN_EPOCHS=${NN_EPOCHS:-100}
 NN_HIDDEN_DIM=${NN_HIDDEN_DIM:-256}
 NN_LR=${NN_LR:-0.001}
 INCLUDE_RANDOM_BASELINE=${INCLUDE_RANDOM_BASELINE:-true}
+PRETRAINED_EMBEDDINGS=${PRETRAINED_EMBEDDINGS:-}
 
 # Validate required parameters
 if [ -z "${CSV_DIR}" ] || [ "${CSV_DIR}" == "/path/to/your/csv/data" ]; then
@@ -109,6 +110,7 @@ echo "  Seed: ${SEED}"
 echo "  NN epochs: ${NN_EPOCHS}"
 echo "  NN hidden dim: ${NN_HIDDEN_DIM}"
 echo "  NN learning rate: ${NN_LR}"
+echo "  Pretrained embeddings: ${PRETRAINED_EMBEDDINGS:-none}"
 echo "  Include random baseline: ${INCLUDE_RANDOM_BASELINE}"
 echo "============================================================"
 echo ""
@@ -124,6 +126,11 @@ if [ -n "${MAX_LENGTH}" ]; then
     MAX_LENGTH_FLAG="--max_length=${MAX_LENGTH}"
 fi
 
+PRETRAINED_EMB_FLAG=""
+if [ -n "${PRETRAINED_EMBEDDINGS}" ]; then
+    PRETRAINED_EMB_FLAG="--pretrained_embeddings=${PRETRAINED_EMBEDDINGS}"
+fi
+
 # Run embedding analysis
 python src/evo2_embedding_analysis.py \
     --csv_dir="${CSV_DIR}" \
@@ -137,6 +144,7 @@ python src/evo2_embedding_analysis.py \
     --nn_hidden_dim=${NN_HIDDEN_DIM} \
     --nn_lr=${NN_LR} \
     ${MAX_LENGTH_FLAG} \
+    ${PRETRAINED_EMB_FLAG} \
     ${RANDOM_BASELINE_FLAG}
 
 echo ""

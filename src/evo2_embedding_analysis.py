@@ -124,9 +124,20 @@ def parse_arguments() -> argparse.Namespace:
         help="Learning rate for 3-layer NN",
     )
     parser.add_argument(
+        "--pretrained_embeddings",
+        type=str,
+        default=None,
+        help="Path to pre-extracted pretrained embeddings (.npz file with "
+             "train_embeddings, train_labels, val_embeddings, val_labels, "
+             "test_embeddings, test_labels). Skips model loading and embedding "
+             "extraction when provided.",
+    )
+    parser.add_argument(
         "--include_random_baseline",
         action="store_true",
-        help="Include random embedding baseline to measure embedding power",
+        help="Include random embedding baseline (randomly-initialized model) to measure "
+             "the value of pretraining. Uses the same architecture and tokenizer but with "
+             "random weights.",
     )
     return parser.parse_args()
 
@@ -515,44 +526,67 @@ def train_three_layer_nn(
     return metrics, model, scaler, predictions
 
 
-def generate_random_embeddings(n_samples: int, hidden_dim: int, seed: int) -> np.ndarray:
-    """Generate random baseline embeddings (Gaussian noise).
+def randomize_model_weights(model, seed: int = 0) -> None:
+    """Randomize all model weights in-place while preserving architecture and tokenizer.
 
-    This serves as a null baseline — if the pretrained model has learned meaningful
-    structure, classifiers trained on its embeddings should significantly outperform
-    classifiers trained on random embeddings of the same shape.
+    This creates the proper null baseline for measuring pretraining value:
+    same architecture, same tokenizer, but untrained (random) weights.
+    Different input sequences will still produce different embeddings due to
+    the architecture's inductive biases and the tokenizer's mapping.
+
+    Args:
+        model: Evo2 model object (has .model attribute with the PyTorch model)
+        seed: Random seed for reproducible initialization
     """
-    rng = np.random.RandomState(seed)
-    return rng.randn(n_samples, hidden_dim)
+    torch.manual_seed(seed)
+    pytorch_model = model.model if hasattr(model, 'model') else model
+    n_params = 0
+    for name, param in pytorch_model.named_parameters():
+        with torch.no_grad():
+            if param.dim() >= 2:
+                # Xavier uniform for weight matrices
+                torch.nn.init.xavier_uniform_(param)
+            elif param.dim() == 1:
+                # Zero-initialize biases and 1D params
+                torch.nn.init.zeros_(param)
+        n_params += param.numel()
+    print(f"  Randomized {n_params:,} parameters")
 
 
 def run_random_baseline(
     train_labels: np.ndarray,
     val_labels: np.ndarray,
     test_labels: np.ndarray,
-    hidden_dim: int,
     seed: int,
     nn_hidden_dim: int,
     nn_epochs: int,
     nn_lr: float,
     device: torch.device,
     output_dir: str,
+    random_model_embeddings: Dict[str, np.ndarray],
 ) -> Tuple[Dict[str, float], Dict]:
-    """Run the full evaluation pipeline on random embeddings.
+    """Run the full evaluation pipeline on embeddings from a randomly-initialized model.
+
+    The random model baseline uses the same architecture and tokenizer as the
+    pretrained model, but with randomized weights. This isolates the contribution
+    of pretraining from the architecture's inductive biases.
+
+    Args:
+        random_model_embeddings: Pre-extracted embeddings from a randomly-initialized
+            model. Required keys: 'train', 'val', 'test'
 
     Returns:
         Tuple of (metrics dict with 'random_' prefix, predictions dict)
     """
     print("\n" + "#" * 60)
-    print("RANDOM BASELINE EVALUATION")
+    print("RANDOM MODEL BASELINE EVALUATION")
     print("#" * 60)
-    print(f"Generating random embeddings: ({len(train_labels)}, {hidden_dim}), "
-          f"({len(val_labels)}, {hidden_dim}), ({len(test_labels)}, {hidden_dim})")
-
-    # Generate random embeddings matching pretrained shapes
-    train_random = generate_random_embeddings(len(train_labels), hidden_dim, seed)
-    val_random = generate_random_embeddings(len(val_labels), hidden_dim, seed + 1)
-    test_random = generate_random_embeddings(len(test_labels), hidden_dim, seed + 2)
+    print("Using embeddings from randomly-initialized model")
+    print("(same architecture + tokenizer, random weights)")
+    train_random = random_model_embeddings['train']
+    val_random = random_model_embeddings['val']
+    test_random = random_model_embeddings['test']
+    print(f"  Shapes: train={train_random.shape}, val={val_random.shape}, test={test_random.shape}")
 
     results = {}
 
@@ -688,18 +722,34 @@ def main():
     # Load data
     train_df, val_df, test_df = load_csv_data(args.csv_dir)
 
-    # Check if embeddings already exist (backward compat: try both names)
-    embeddings_path = os.path.join(args.output_dir, "embeddings_pretrained.npz")
-    legacy_path = os.path.join(args.output_dir, "embeddings.npz")
-    if os.path.exists(embeddings_path):
-        load_path = embeddings_path
-    elif os.path.exists(legacy_path):
-        load_path = legacy_path
+    # Check if embeddings already exist
+    # Priority: --pretrained_embeddings flag > output_dir cache > legacy path
+    if args.pretrained_embeddings:
+        if not os.path.exists(args.pretrained_embeddings):
+            raise FileNotFoundError(f"Pretrained embeddings not found: {args.pretrained_embeddings}")
+        load_path = args.pretrained_embeddings
     else:
-        load_path = None
+        embeddings_path = os.path.join(args.output_dir, "embeddings_pretrained.npz")
+        legacy_path = os.path.join(args.output_dir, "embeddings.npz")
+        if os.path.exists(embeddings_path):
+            load_path = embeddings_path
+        elif os.path.exists(legacy_path):
+            load_path = legacy_path
+        else:
+            load_path = None
 
-    if load_path is not None:
-        print(f"\nFound existing embeddings at: {load_path}")
+    # Check if random model embeddings are cached
+    random_model_path = os.path.join(args.output_dir, "embeddings_random_model.npz")
+    need_random_model = args.include_random_baseline
+    random_model_cached = os.path.exists(random_model_path) if need_random_model else True
+    random_model_embeddings = None
+
+    # Determine if we need to load the model
+    pretrained_cached = load_path is not None
+    need_model = not pretrained_cached or (need_random_model and not random_model_cached)
+
+    if pretrained_cached:
+        print(f"\nFound existing pretrained embeddings at: {load_path}")
         print("Loading embeddings from file (delete file to re-extract)...")
         loaded = np.load(load_path)
         train_embeddings = loaded["train_embeddings"]
@@ -709,60 +759,131 @@ def main():
         test_embeddings = loaded["test_embeddings"]
         test_labels = loaded["test_labels"]
         print(f"Loaded embeddings - shape: {test_embeddings.shape}")
-    else:
+
+    if need_random_model and random_model_cached:
+        print(f"\nFound existing random model embeddings at: {random_model_path}")
+        print("Loading random model embeddings from file (delete file to re-extract)...")
+        loaded_random = np.load(random_model_path)
+        random_model_embeddings = {
+            'train': loaded_random["train_embeddings"],
+            'val': loaded_random["val_embeddings"],
+            'test': loaded_random["test_embeddings"],
+        }
+        print(f"Loaded random model embeddings - shape: {random_model_embeddings['test'].shape}")
+
+    if need_model:
         # Load Evo2 model
         print(f"\nLoading Evo2 model: {args.model}")
         from evo2 import Evo2
         evo2_model = Evo2(args.model)
         print(f"  Model loaded")
 
-        # Extract embeddings
-        print(f"\nExtracting train embeddings...")
-        train_embeddings, train_labels = extract_embeddings(
-            evo2_model,
-            train_df["sequence"].tolist(),
-            train_df["label"].tolist(),
-            args.layer,
-            args.batch_size,
-            args.max_length,
-            args.pooling,
-        )
+        # Extract pretrained embeddings if not cached
+        if not pretrained_cached:
+            print(f"\nExtracting pretrained train embeddings...")
+            train_embeddings, train_labels = extract_embeddings(
+                evo2_model,
+                train_df["sequence"].tolist(),
+                train_df["label"].tolist(),
+                args.layer,
+                args.batch_size,
+                args.max_length,
+                args.pooling,
+            )
 
-        print(f"\nExtracting validation embeddings...")
-        val_embeddings, val_labels = extract_embeddings(
-            evo2_model,
-            val_df["sequence"].tolist(),
-            val_df["label"].tolist(),
-            args.layer,
-            args.batch_size,
-            args.max_length,
-            args.pooling,
-        )
+            print(f"\nExtracting pretrained validation embeddings...")
+            val_embeddings, val_labels = extract_embeddings(
+                evo2_model,
+                val_df["sequence"].tolist(),
+                val_df["label"].tolist(),
+                args.layer,
+                args.batch_size,
+                args.max_length,
+                args.pooling,
+            )
 
-        print(f"\nExtracting test embeddings...")
-        test_embeddings, test_labels = extract_embeddings(
-            evo2_model,
-            test_df["sequence"].tolist(),
-            test_df["label"].tolist(),
-            args.layer,
-            args.batch_size,
-            args.max_length,
-            args.pooling,
-        )
+            print(f"\nExtracting pretrained test embeddings...")
+            test_embeddings, test_labels = extract_embeddings(
+                evo2_model,
+                test_df["sequence"].tolist(),
+                test_df["label"].tolist(),
+                args.layer,
+                args.batch_size,
+                args.max_length,
+                args.pooling,
+            )
 
-        print(f"\nEmbedding shape: {test_embeddings.shape}")
+            print(f"\nPretrained embedding shape: {test_embeddings.shape}")
 
-        # Save embeddings with new name
-        np.savez(
-            embeddings_path,
-            train_embeddings=train_embeddings,
-            train_labels=train_labels,
-            val_embeddings=val_embeddings,
-            val_labels=val_labels,
-            test_embeddings=test_embeddings,
-            test_labels=test_labels,
-        )
-        print(f"\nSaved embeddings to: {embeddings_path}")
+            # Save pretrained embeddings
+            np.savez(
+                embeddings_path,
+                train_embeddings=train_embeddings,
+                train_labels=train_labels,
+                val_embeddings=val_embeddings,
+                val_labels=val_labels,
+                test_embeddings=test_embeddings,
+                test_labels=test_labels,
+            )
+            print(f"Saved pretrained embeddings to: {embeddings_path}")
+
+        # Extract random model embeddings if needed and not cached
+        if need_random_model and not random_model_cached:
+            print("\n" + "=" * 60)
+            print("Extracting embeddings from randomly-initialized model")
+            print("=" * 60)
+            print("Randomizing model weights (keeping architecture + tokenizer)...")
+            randomize_model_weights(evo2_model, seed=args.seed + 100)
+
+            print(f"\nExtracting random model train embeddings...")
+            train_random_emb, _ = extract_embeddings(
+                evo2_model,
+                train_df["sequence"].tolist(),
+                train_df["label"].tolist(),
+                args.layer,
+                args.batch_size,
+                args.max_length,
+                args.pooling,
+            )
+
+            print(f"\nExtracting random model validation embeddings...")
+            val_random_emb, _ = extract_embeddings(
+                evo2_model,
+                val_df["sequence"].tolist(),
+                val_df["label"].tolist(),
+                args.layer,
+                args.batch_size,
+                args.max_length,
+                args.pooling,
+            )
+
+            print(f"\nExtracting random model test embeddings...")
+            test_random_emb, _ = extract_embeddings(
+                evo2_model,
+                test_df["sequence"].tolist(),
+                test_df["label"].tolist(),
+                args.layer,
+                args.batch_size,
+                args.max_length,
+                args.pooling,
+            )
+
+            print(f"Random model embedding shape: {test_random_emb.shape}")
+
+            # Cache random model embeddings
+            np.savez(
+                random_model_path,
+                train_embeddings=train_random_emb,
+                val_embeddings=val_random_emb,
+                test_embeddings=test_random_emb,
+            )
+            print(f"Saved random model embeddings to: {random_model_path}")
+
+            random_model_embeddings = {
+                'train': train_random_emb,
+                'val': val_random_emb,
+                'test': test_random_emb,
+            }
 
         # Free model memory
         del evo2_model
@@ -839,13 +960,13 @@ def main():
         for k, v in pretrained_results.items():
             results[f"pretrained_{k}"] = v
 
-        # Run random baseline
-        hidden_dim = test_embeddings.shape[1]
+        # Run random baseline (randomly-initialized model)
         random_results, random_preds = run_random_baseline(
             train_labels, val_labels, test_labels,
-            hidden_dim, args.seed,
+            args.seed,
             args.nn_hidden_dim, args.nn_epochs, args.nn_lr,
             device, args.output_dir,
+            random_model_embeddings=random_model_embeddings,
         )
         results.update(random_results)
 
