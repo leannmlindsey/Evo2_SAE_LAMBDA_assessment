@@ -190,7 +190,7 @@ def main():
     torch.cuda.empty_cache()
     print("Freed pretrained model memory")
 
-    # Load config and disable flash attention
+    # Load config (keep flash_attn enabled + bfloat16 for speed)
     config_name = args.model
     if config_name not in CONFIG_MAP:
         config_name = f"{args.model}_base"
@@ -198,8 +198,6 @@ def main():
     print(f"Config: {config_name} -> {config_path}")
 
     cfg = yaml.safe_load(pkgutil.get_data("evo2", config_path))
-    cfg["use_flash_attn"] = False
-    cfg["inference_mode"] = False
     cfg = dotdict(cfg)
 
     hidden_size = cfg.get("hidden_size", 4096)
@@ -222,7 +220,8 @@ def main():
     )
     random_model.load_state_dict(random_sd, strict=False)
 
-    random_model = random_model.float().to("cuda:0")
+    random_model.to_bfloat16_except_pr_lc()
+    random_model = random_model.to("cuda:0")
     random_model.eval()
 
     n_params = sum(p.numel() for p in random_model.parameters())
