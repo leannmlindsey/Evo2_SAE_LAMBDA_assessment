@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Quick test: extract 32 embeddings from pretrained and random models, compare.
+Quick test: load cached pretrained embeddings, extract 32 random embeddings, compare.
 
 Verifies that:
 1. Random embeddings contain no NaN/Inf
@@ -10,6 +10,7 @@ Verifies that:
 Usage:
     python scripts/test_random_embeddings.py \
         --csv_dir /path/to/csv/data \
+        --pretrained_embeddings /path/to/embeddings_pretrained.npz \
         --model evo2_7b \
         --layer blocks.28.mlp.l3
 """
@@ -26,7 +27,10 @@ from tqdm import tqdm
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Test random vs pretrained embeddings")
-    parser.add_argument("--csv_dir", type=str, required=True)
+    parser.add_argument("--csv_dir", type=str, required=True,
+                        help="Path to CSV dir (need train.csv for sequences)")
+    parser.add_argument("--pretrained_embeddings", type=str, required=True,
+                        help="Path to cached pretrained embeddings .npz file")
     parser.add_argument("--model", type=str, default="evo2_7b")
     parser.add_argument("--layer", type=str, default="blocks.28.mlp.l3")
     parser.add_argument("--pooling", type=str, default="mean")
@@ -39,7 +43,7 @@ def parse_args():
 def extract_batch(model, sequences, layer_name, pooling, max_length):
     """Extract embeddings for a small batch of sequences."""
     all_embeddings = []
-    for seq in tqdm(sequences, desc="Extracting"):
+    for seq in tqdm(sequences, desc="Extracting random embeddings"):
         if max_length is not None and len(seq) > max_length:
             seq = seq[:max_length]
         input_ids = torch.tensor(
@@ -66,38 +70,39 @@ def main():
     args = parse_args()
     start = time.time()
 
-    # Load first n_samples from train.csv
-    train_path = f"{args.csv_dir}/train.csv"
-    df = pd.read_csv(train_path)
-    sequences = df["sequence"].tolist()[: args.n_samples]
-    print(f"Using {len(sequences)} sequences from {train_path}")
-    print(f"Sequence lengths: {[len(s) for s in sequences[:5]]}...")
-
     # ---------------------------------------------------------------
-    # 1. Load pretrained model and extract embeddings
+    # 1. Load cached pretrained embeddings (no model needed)
     # ---------------------------------------------------------------
     print(f"\n{'='*60}")
-    print("STEP 1: Extract pretrained embeddings")
+    print("STEP 1: Load cached pretrained embeddings")
     print(f"{'='*60}")
-    from evo2 import Evo2
-    model = Evo2(args.model)
-    pretrained_dtype = next(model.model.parameters()).dtype
-    print(f"Pretrained model dtype: {pretrained_dtype}")
-
-    pretrained_emb = extract_batch(
-        model, sequences, args.layer, args.pooling, args.max_length
-    )
-    print(f"Pretrained embeddings shape: {pretrained_emb.shape}")
-    print(f"  NaN: {np.isnan(pretrained_emb).any()}, Inf: {np.isinf(pretrained_emb).any()}")
+    loaded = np.load(args.pretrained_embeddings)
+    pretrained_emb = loaded["train_embeddings"][: args.n_samples]
+    print(f"Loaded {pretrained_emb.shape[0]} pretrained embeddings "
+          f"from {args.pretrained_embeddings}")
+    print(f"  Shape: {pretrained_emb.shape}")
+    print(f"  NaN: {np.isnan(pretrained_emb).any()}, "
+          f"Inf: {np.isinf(pretrained_emb).any()}")
     print(f"  Sample [0][:5]: {pretrained_emb[0, :5]}")
     print(f"  Sample [1][:5]: {pretrained_emb[1, :5]}")
 
+    # Load matching sequences from train.csv
+    train_path = f"{args.csv_dir}/train.csv"
+    df = pd.read_csv(train_path)
+    sequences = df["sequence"].tolist()[: args.n_samples]
+    print(f"\nUsing first {len(sequences)} sequences from {train_path}")
+
     # ---------------------------------------------------------------
-    # 2. Replace weights with random initialization
+    # 2. Load model and replace weights with random initialization
     # ---------------------------------------------------------------
     print(f"\n{'='*60}")
-    print("STEP 2: Replace weights with random init")
+    print("STEP 2: Load model + replace with random weights")
     print(f"{'='*60}")
+
+    from evo2 import Evo2
+    print(f"Loading Evo2 model: {args.model}")
+    model = Evo2(args.model)
+    print(f"Pretrained model dtype: {next(model.model.parameters()).dtype}")
 
     import yaml
     import pkgutil
@@ -126,14 +131,17 @@ def main():
     model.model.load_state_dict(random_sd, strict=True)
     print("Loaded random state_dict into pretrained backbone")
 
+    # Cast to float32 to prevent NaN from bfloat16 overflow
+    print("Casting model to float32...")
+    model.model.float()
+    print(f"Model dtype: {next(model.model.parameters()).dtype}")
+
     # ---------------------------------------------------------------
-    # 3. Cast to float32 and extract random embeddings
+    # 3. Extract random embeddings for the same sequences
     # ---------------------------------------------------------------
     print(f"\n{'='*60}")
     print("STEP 3: Extract random embeddings (float32)")
     print(f"{'='*60}")
-    model.model.float()
-    print(f"Model dtype after .float(): {next(model.model.parameters()).dtype}")
 
     random_emb = extract_batch(
         model, sequences, args.layer, args.pooling, args.max_length
@@ -192,10 +200,10 @@ def main():
         failed += 1
 
     # Check 5: Random != pretrained (low correlation)
-    flat_r = random_emb.flatten()[:10000].astype(np.float64)
-    flat_p = pretrained_emb.flatten()[:10000].astype(np.float64)
-    # Only compute correlation if no NaN
     if nan_count == 0:
+        n = min(10000, pretrained_emb.size, random_emb.size)
+        flat_r = random_emb.flatten()[:n].astype(np.float64)
+        flat_p = pretrained_emb.flatten()[:n].astype(np.float64)
         corr = np.corrcoef(flat_r, flat_p)[0, 1]
         if abs(corr) < 0.3:
             print(f"  PASS: Low correlation with pretrained = {corr:.4f}")
@@ -208,8 +216,10 @@ def main():
 
     # Check 6: Pairwise distance between random embeddings is non-trivial
     if nan_count == 0:
-        dists = np.linalg.norm(random_emb[:min(10, len(random_emb))] - random_emb[0], axis=1)
-        mean_dist = dists[1:].mean()  # skip self-distance
+        dists = np.linalg.norm(
+            random_emb[:min(10, len(random_emb))] - random_emb[0], axis=1
+        )
+        mean_dist = dists[1:].mean()
         if mean_dist > 1e-3:
             print(f"  PASS: Mean L2 distance between samples = {mean_dist:.4f}")
             passed += 1
