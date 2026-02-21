@@ -937,6 +937,38 @@ def main():
             print("Replacing pretrained weights with random initialization...")
             replace_with_random_weights(evo2_model, args.model, seed=args.seed + 100)
 
+            # Cast to float32 to prevent NaN from bfloat16 overflow with random weights.
+            # Pretrained weights are in a stable regime learned during training, but random
+            # weights can cause activations to explode through 32 layers in bfloat16.
+            print("  Casting model to float32 for numerical stability with random weights...")
+            evo2_model.model.float()
+
+            # Smoke test: run ONE sequence to verify no NaN before full extraction
+            print("  Smoke test: running one sequence through random model...")
+            test_seq = train_df["sequence"].iloc[0]
+            if args.max_length is not None and len(test_seq) > args.max_length:
+                test_seq = test_seq[:args.max_length]
+            test_ids = torch.tensor(
+                evo2_model.tokenizer.tokenize(test_seq), dtype=torch.int
+            ).unsqueeze(0).to('cuda:0')
+            with torch.no_grad():
+                test_out, test_emb = evo2_model(
+                    test_ids, return_embeddings=True, layer_names=[args.layer]
+                )
+            test_vec = test_emb[args.layer].cpu().float().numpy()
+            has_nan = np.isnan(test_vec).any()
+            has_inf = np.isinf(test_vec).any()
+            print(f"    Output shape: {test_vec.shape}")
+            print(f"    NaN: {has_nan}, Inf: {has_inf}")
+            print(f"    Sample values: {test_vec.flatten()[:5]}")
+            if has_nan or has_inf:
+                raise RuntimeError(
+                    "Random model produces NaN/Inf embeddings even in float32. "
+                    "Cannot extract random baseline embeddings."
+                )
+            print("  Smoke test passed — proceeding with full extraction.")
+            del test_ids, test_out, test_emb, test_vec
+
             print(f"\nExtracting random model train embeddings...")
             train_random_emb, _ = extract_embeddings(
                 evo2_model,
@@ -972,7 +1004,16 @@ def main():
 
             print(f"Random model embedding shape: {test_random_emb.shape}")
 
-            # Sanity check: verify embeddings have variance
+            # Sanity check: verify embeddings have variance and no NaN/Inf
+            for name, emb in [("train", train_random_emb), ("val", val_random_emb), ("test", test_random_emb)]:
+                nan_count = np.isnan(emb).sum()
+                inf_count = np.isinf(emb).sum()
+                nan_rows = np.any(np.isnan(emb), axis=1).sum()
+                if nan_count > 0 or inf_count > 0:
+                    print(f"  WARNING: {name} random embeddings contain "
+                          f"{nan_count} NaN, {inf_count} Inf values "
+                          f"({nan_rows}/{len(emb)} rows affected)")
+
             test_var = np.var(test_random_emb, axis=0).mean()
             test_range = np.ptp(test_random_emb, axis=0).mean()
             all_same = np.allclose(test_random_emb[0], test_random_emb[1]) if len(test_random_emb) > 1 else False
