@@ -1219,6 +1219,13 @@ def main():
     }, nn_model_path)
     print(f"Saved 3-layer NN to: {nn_model_path}")
 
+    # Save scaler (needed for inference on new data)
+    import pickle
+    scaler_path = os.path.join(args.output_dir, "three_layer_nn_scaler.pkl")
+    with open(scaler_path, "wb") as f:
+        pickle.dump(nn_scaler, f)
+    print(f"Saved scaler to: {scaler_path}")
+
     # Build final results dict
     results = {}
 
