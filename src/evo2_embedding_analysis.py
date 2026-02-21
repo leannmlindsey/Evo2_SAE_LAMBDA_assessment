@@ -237,7 +237,7 @@ def train_linear_probe(
     test_embeddings: np.ndarray,
     test_labels: np.ndarray,
     seed: int,
-) -> Tuple[Dict[str, float], Dict]:
+) -> Tuple[Dict[str, float], Dict, StandardScaler, LogisticRegression]:
     """Train a linear probe (logistic regression) classifier."""
     print("\n" + "=" * 60)
     print("Training Linear Probe (Logistic Regression)")
@@ -289,7 +289,7 @@ def train_linear_probe(
         "test_preds": test_preds,
         "test_probs": test_probs,
     }
-    return metrics, predictions
+    return metrics, predictions, scaler, clf
 
 
 def calculate_silhouette(embeddings: np.ndarray, labels: np.ndarray) -> float:
@@ -837,7 +837,7 @@ def run_random_baseline(
     results = {}
 
     # Linear probe on random embeddings
-    lp_metrics, lp_preds = train_linear_probe(
+    lp_metrics, lp_preds, _, _ = train_linear_probe(
         train_random, train_labels,
         test_random, test_labels,
         seed,
@@ -1161,7 +1161,7 @@ def main():
     pretrained_results = {}
 
     # 1. Train linear probe
-    linear_metrics, linear_preds = train_linear_probe(
+    linear_metrics, linear_preds, lp_scaler, lp_clf = train_linear_probe(
         train_embeddings, train_labels,
         test_embeddings, test_labels,
         args.seed,
@@ -1219,12 +1219,22 @@ def main():
     }, nn_model_path)
     print(f"Saved 3-layer NN to: {nn_model_path}")
 
-    # Save scaler (needed for inference on new data)
+    # Save scalers and models (needed for inference on new data)
     import pickle
     scaler_path = os.path.join(args.output_dir, "three_layer_nn_scaler.pkl")
     with open(scaler_path, "wb") as f:
         pickle.dump(nn_scaler, f)
-    print(f"Saved scaler to: {scaler_path}")
+    print(f"Saved NN scaler to: {scaler_path}")
+
+    # Save linear probe model and scaler
+    lp_scaler_path = os.path.join(args.output_dir, "linear_probe_scaler.pkl")
+    with open(lp_scaler_path, "wb") as f:
+        pickle.dump(lp_scaler, f)
+    lp_model_path = os.path.join(args.output_dir, "linear_probe.pkl")
+    with open(lp_model_path, "wb") as f:
+        pickle.dump(lp_clf, f)
+    print(f"Saved linear probe to: {lp_model_path}")
+    print(f"Saved LP scaler to: {lp_scaler_path}")
 
     # Build final results dict
     results = {}
