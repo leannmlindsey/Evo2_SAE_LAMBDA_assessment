@@ -526,21 +526,154 @@ def train_three_layer_nn(
     return metrics, model, scaler, predictions
 
 
-def replace_with_random_weights(evo2_model, model_name: str, seed: int = 0) -> None:
-    """Replace pretrained weights with random initialization via load_state_dict.
+def apply_savanna_style_init(state_dict, hidden_size=4096, num_layers=32,
+                             short_filter_length=3, seed=42):
+    """Apply Savanna-style initialization to a Vortex StripedHyena state_dict.
 
-    Creates a temporary StripedHyena from config (which gets PyTorch's correct
-    default initialization for every layer type), extracts its state_dict
-    (parameters AND buffers), then loads it into the existing pretrained backbone.
+    Vortex initializes all HyenaCascade parameters with torch.randn(), which
+    is fine when loading from checkpoint but causes NaN from scratch because:
+    - log_poles initialized with randn can be POSITIVE, meaning the IIR filter
+      GROWS exponentially instead of decaying -> overflow -> NaN after 32 layers
+    - Linear weights at default scale compound through 32 layers
+
+    Savanna (the training framework that actually pretrained Evo2) uses:
+    - small_init for linear weights: N(0, sqrt(2/(5*hidden_size)))
+    - wang_init for output projections: N(0, 2/(num_layers*sqrt(hidden_size)))
+    - Negative log_poles (from ComplexModalFilter: A.real = -0.5, always negative)
+    - Very small FIR filter values (1e-5 scale)
+    - Uniform short conv weights: U(-1/sqrt(kernel_size), 1/sqrt(kernel_size))
+
+    Reference: github.com/Zymrael/savanna (Evo2's training framework)
+    Key files: savanna/model/init_functions.py, savanna/model/operators/hyena/
+
+    Args:
+        state_dict: State dict from a Vortex StripedHyena (will be modified in-place)
+        hidden_size: Model hidden size (4096 for evo2_7b)
+        num_layers: Number of layers (32 for evo2_7b)
+        short_filter_length: Short convolution kernel size (3 for evo2_7b)
+        seed: Random seed
+    """
+    import math
+
+    torch.manual_seed(seed)
+
+    # Savanna init scales (from savanna/model/init_functions.py)
+    small_init_std = math.sqrt(2.0 / (5.0 * hidden_size))   # ~0.0099
+    wang_init_std = 2.0 / num_layers / math.sqrt(hidden_size)  # ~0.000977
+    short_conv_bound = math.sqrt(1.0 / short_filter_length)    # ~0.577
+
+    n_log_poles = 0
+    n_residues = 0
+    n_fir_filters = 0
+    n_short_conv = 0
+    n_linear = 0
+    n_norm = 0
+    n_bias = 0
+    n_skipped = 0
+
+    for key in list(state_dict.keys()):
+        tensor = state_dict[key]
+
+        # Skip _extra_state keys (FP8 metadata from TransformerEngine, not tensors)
+        if '_extra_state' in key:
+            n_skipped += 1
+            continue
+
+        # Skip non-tensor entries
+        if not isinstance(tensor, torch.Tensor):
+            n_skipped += 1
+            continue
+
+        # 1. IIR log_poles: MUST be negative for filter decay (not explosion)
+        #    Savanna's ComplexModalFilter uses A.real = -0.5, dt in [0.001, 0.1]
+        #    so log_poles ≈ dt * A.real ∈ [-0.05, -0.0005]
+        #    We use -|randn| * 0.5 - 0.1 to ensure all values are negative
+        if 'log_poles' in key:
+            state_dict[key] = -torch.abs(torch.randn_like(tensor)) * 0.5 - 0.1
+            n_log_poles += 1
+
+        # 2. IIR residues: small random values, scaled by 1/sqrt(state_size)
+        elif 'residues' in key:
+            state_size = tensor.shape[-1] if tensor.dim() > 1 else 16
+            state_dict[key] = torch.randn_like(tensor) * 0.1 / math.sqrt(state_size)
+            n_residues += 1
+
+        # 3. D parameter (skip connection in IIR filter): zeros
+        elif key.endswith('.D'):
+            state_dict[key] = torch.zeros_like(tensor)
+
+        # 4. FIR inner filter h: very small values (Savanna explicit filter uses 1e-5)
+        elif '.filter.h' in key or (key.endswith('.h') and 'filter' in key):
+            filter_length = tensor.shape[-1]
+            state_dict[key] = torch.randn_like(tensor) / math.sqrt(filter_length) * 1e-3
+            n_fir_filters += 1
+
+        # 5. Short filter weight: uniform ±1/sqrt(kernel_size)
+        #    (from Savanna's ParallelCausalDepthwiseConv1d)
+        elif 'short_filter_weight' in key:
+            state_dict[key] = torch.empty_like(tensor).uniform_(
+                -short_conv_bound, short_conv_bound
+            )
+            n_short_conv += 1
+
+        # 6. Short filter bias: zeros
+        elif 'short_filter_bias' in key:
+            state_dict[key] = torch.zeros_like(tensor)
+            n_bias += 1
+
+        # 7. RMSNorm / LayerNorm weights: ones (standard default)
+        elif 'norm' in key and 'weight' in key:
+            state_dict[key] = torch.ones_like(tensor)
+            n_norm += 1
+
+        # 8. Other biases: zeros
+        elif key.endswith('.bias'):
+            state_dict[key] = torch.zeros_like(tensor)
+            n_bias += 1
+
+        # 9. Output projection weights: wang_init (depth-scaled)
+        elif ('out_filter_dense' in key or 'out_proj' in key) and 'weight' in key:
+            state_dict[key] = torch.randn_like(tensor) * wang_init_std
+            n_linear += 1
+
+        # 10. All other weight matrices (linear layers, embeddings): small_init
+        elif 'weight' in key and tensor.dim() >= 2:
+            state_dict[key] = torch.randn_like(tensor) * small_init_std
+            n_linear += 1
+
+        # 11. Rotary embedding inv_freq buffers: leave as-is (computed from config)
+        elif 'inv_freq' in key:
+            n_skipped += 1
+
+        else:
+            n_skipped += 1
+
+    print(f"  Savanna-style init applied:")
+    print(f"    log_poles (negative): {n_log_poles}")
+    print(f"    residues (small): {n_residues}")
+    print(f"    FIR filters (1e-3 scale): {n_fir_filters}")
+    print(f"    short conv weights (uniform): {n_short_conv}")
+    print(f"    linear weights (small_init/wang_init): {n_linear}")
+    print(f"    norm weights (ones): {n_norm}")
+    print(f"    biases (zeros): {n_bias}")
+    print(f"    skipped (extra_state/buffers): {n_skipped}")
+
+
+def replace_with_random_weights(evo2_model, model_name: str, seed: int = 0) -> None:
+    """Replace pretrained weights with Savanna-style random initialization.
+
+    Creates a random state_dict matching the pretrained model's structure, applies
+    Savanna-style initialization to ensure numerical stability, then loads it into
+    the existing pretrained backbone via load_state_dict.
+
+    The key insight: Vortex's default random init produces NaN because IIR filter
+    log_poles can be positive (causing exponential growth). Savanna's training
+    framework always initializes log_poles as negative (ensuring exponential decay).
 
     Using load_state_dict preserves:
     - Vortex multi-GPU device placement (copy_ keeps tensors on their devices)
-    - dtype (float16/bfloat16 is preserved, source is cast automatically)
+    - dtype (bfloat16 is preserved, source is cast automatically)
     - The Evo2 wrapper's internal references to self.model
-
-    The old named_parameters() approach failed because it missed buffers (e.g.
-    Hyena convolution filters, SSM recurrence matrices, positional state) which
-    are included in state_dict but not in named_parameters.
 
     Args:
         evo2_model: Evo2 model wrapper object
@@ -553,9 +686,7 @@ def replace_with_random_weights(evo2_model, model_name: str, seed: int = 0) -> N
     from vortex.model.model import StripedHyena
     from vortex.model.utils import dotdict
 
-    torch.manual_seed(seed)
-
-    # Resolve config name: CONFIG_MAP may use different key conventions
+    # Resolve config name
     config_name = model_name
     if config_name not in CONFIG_MAP:
         config_name = f"{model_name}_base"
@@ -571,100 +702,100 @@ def replace_with_random_weights(evo2_model, model_name: str, seed: int = 0) -> N
     cfg = yaml.safe_load(pkgutil.get_data("evo2", config_path))
     cfg = dotdict(cfg)
 
-    # Step 1: Create a temporary StripedHyena to get properly-initialized random
-    # weights. PyTorch's default init handles each layer type correctly
-    # (Xavier for linear, ones for norm scales, etc.)
-    # Note: Vortex will place it on GPU (CUDA is already initialized so we can't
-    # force CPU via env vars). Both models briefly coexist in GPU memory.
-    print(f"  Creating temporary StripedHyena for random state_dict (seed={seed})...")
+    hidden_size = cfg.get("hidden_size", 4096)
+    num_layers = cfg.get("num_layers", 32)
+    short_filter_length = cfg.get("short_filter_length", 3)
+
+    # Step 1: Create a temporary StripedHyena to get the correct state_dict structure
+    # (parameter names, shapes, dtypes). Both models briefly coexist in GPU memory.
+    print(f"  Creating temporary StripedHyena for state_dict structure (seed={seed})...")
+    torch.manual_seed(seed)
     temp_model = StripedHyena(cfg)
 
-    # Step 2: Extract the random state_dict (parameters + buffers) to CPU
+    # Step 2: Extract state_dict to CPU and free temp model immediately
     random_sd = {k: v.cpu() for k, v in temp_model.state_dict().items()}
-
-    n_params = sum(p.numel() for p in temp_model.parameters())
-    n_buffers = sum(b.numel() for b in temp_model.buffers())
     n_sd_keys = len(random_sd)
-    print(f"  Random state_dict: {n_sd_keys} keys, "
-          f"{n_params:,} parameter elements, {n_buffers:,} buffer elements")
-
-    # Step 3: Free the temporary model
+    n_params = sum(p.numel() for p in temp_model.parameters())
+    print(f"  State_dict: {n_sd_keys} keys, {n_params:,} parameter elements")
     del temp_model
+    torch.cuda.empty_cache()
 
-    # Step 3b: Scale down weight matrices for bfloat16 numerical stability.
-    # Flash attention requires bfloat16 (cannot use float32), and random weights
-    # at default PyTorch init scale cause activation overflow through 32 layers.
-    # 0.02 scaling matches GPT-2/3 style init and is known to be stable.
-    WEIGHT_SCALE = 0.02
-    n_scaled = 0
-    for k, v in random_sd.items():
-        if v.dim() >= 2:
-            random_sd[k] = v * WEIGHT_SCALE
-            n_scaled += 1
-    print(f"  Scaled {n_scaled} weight matrices by {WEIGHT_SCALE} "
-          f"for bfloat16 stability")
+    # Step 3: Apply Savanna-style initialization (the critical fix)
+    print(f"\n  Applying Savanna-style initialization...")
+    apply_savanna_style_init(
+        random_sd,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        short_filter_length=short_filter_length,
+        seed=seed,
+    )
 
-    # Step 4: Verify key compatibility and snapshot pretrained values for comparison
+    # Step 4: Verify key compatibility
     pretrained_sd = evo2_model.model.state_dict()
-    pretrained_sd_keys = set(pretrained_sd.keys())
-    random_sd_keys = set(random_sd.keys())
-    missing = pretrained_sd_keys - random_sd_keys
-    unexpected = random_sd_keys - pretrained_sd_keys
+    pretrained_keys = set(pretrained_sd.keys())
+    random_keys = set(random_sd.keys())
+    missing = pretrained_keys - random_keys
+    unexpected = random_keys - pretrained_keys
     if missing:
-        print(f"  WARNING: {len(missing)} keys in pretrained model missing from random "
-              f"state_dict (will keep pretrained values): {list(missing)[:5]}...")
+        print(f"  WARNING: {len(missing)} keys missing from random state_dict: "
+              f"{list(missing)[:5]}...")
     if unexpected:
-        print(f"  WARNING: {len(unexpected)} unexpected keys in random state_dict "
-              f"(will be ignored): {list(unexpected)[:5]}...")
+        print(f"  WARNING: {len(unexpected)} unexpected keys: {list(unexpected)[:5]}...")
 
-    # Save a few pretrained values for comparison after loading
-    check_keys = [k for k in list(random_sd.keys())[:3] if k in pretrained_sd_keys]
+    # Snapshot a few pretrained values for sanity check
+    check_keys = [k for k in list(random_sd.keys()) if k in pretrained_keys
+                  and isinstance(random_sd[k], torch.Tensor)][:3]
     pretrained_snapshots = {k: pretrained_sd[k].cpu().float().clone() for k in check_keys}
-    pretrained_dtype = pretrained_sd[check_keys[0]].dtype if check_keys else None
-    print(f"  Pretrained model dtype: {pretrained_dtype}")
+    del pretrained_sd
 
-    del pretrained_sd  # free memory
+    # Step 5: Load random weights into pretrained backbone
+    use_strict = (not missing and not unexpected)
+    evo2_model.model.load_state_dict(random_sd, strict=use_strict)
+    print(f"  Loaded random state_dict (strict={use_strict})")
 
-    # Step 5: Load random weights into the existing pretrained backbone.
-    # load_state_dict uses .copy_() which preserves device placement and dtype.
-    evo2_model.model.load_state_dict(random_sd, strict=(not missing and not unexpected))
-    print(f"  Loaded random state_dict into pretrained backbone")
-
-    # Step 6: Diagnostic sanity check
+    # Step 6: Sanity check
     new_sd = evo2_model.model.state_dict()
     print(f"\n  === SANITY CHECK ===")
     for key in check_keys:
-        loaded_vals = new_sd[key].cpu().float()
-        random_vals = random_sd[key].float()
-        pretrained_vals = pretrained_snapshots[key]
+        loaded = new_sd[key].cpu().float()
+        target = random_sd[key].float()
+        pretrained = pretrained_snapshots[key]
 
-        # Check: are loaded values close to the random values we intended?
-        matches_random = torch.allclose(loaded_vals, random_vals, atol=1e-2)
-        # Check: are loaded values still the same as pretrained (i.e. load failed)?
-        matches_pretrained = torch.allclose(loaded_vals, pretrained_vals, atol=1e-5)
-        # Correlation with random target (should be ~1.0 if load worked)
-        flat_loaded = loaded_vals.flatten()[:1000].double()
-        flat_random = random_vals.flatten()[:1000].double()
-        flat_pretrained = pretrained_vals.flatten()[:1000].double()
-        corr_random = torch.corrcoef(torch.stack([flat_loaded, flat_random]))[0, 1].item()
-        corr_pretrained = torch.corrcoef(torch.stack([flat_loaded, flat_pretrained]))[0, 1].item()
+        flat_l = loaded.flatten()[:1000].double()
+        flat_t = target.flatten()[:1000].double()
+        flat_p = pretrained.flatten()[:1000].double()
+        corr_target = torch.corrcoef(torch.stack([flat_l, flat_t]))[0, 1].item()
+        corr_pretrained = torch.corrcoef(torch.stack([flat_l, flat_p]))[0, 1].item()
 
-        print(f"  Key: '{key}' (shape={list(loaded_vals.shape)}, dtype={new_sd[key].dtype})")
-        print(f"    Matches random target (atol=1e-2): {matches_random}")
-        print(f"    Still matches pretrained (atol=1e-5): {matches_pretrained}")
-        print(f"    Correlation with random target: {corr_random:.6f}")
-        print(f"    Correlation with pretrained: {corr_pretrained:.6f}")
-        print(f"    Loaded sample:     {loaded_vals.flatten()[:5].tolist()}")
-        print(f"    Random target:     {random_vals.flatten()[:5].tolist()}")
-        print(f"    Pretrained before: {pretrained_vals.flatten()[:5].tolist()}")
+        status = "OK" if corr_target > 0.99 and corr_pretrained < 0.5 else "CHECK"
+        print(f"  [{status}] {key}: corr_with_target={corr_target:.4f}, "
+              f"corr_with_pretrained={corr_pretrained:.4f}")
 
-        if matches_pretrained and not matches_random:
-            print(f"    FAILURE: load_state_dict did NOT change this tensor!")
-        elif matches_random:
-            print(f"    OK: weights successfully replaced")
-        else:
-            print(f"    LIKELY OK: values changed, small differences from dtype "
-                  f"conversion ({pretrained_dtype} roundtrip)")
+    # Step 7: Smoke test — run one short sequence to check for NaN
+    print(f"\n  === SMOKE TEST (1 sequence) ===")
+    test_seq = "ATCGATCGATCGATCG"  # 16bp test
+    input_ids = torch.tensor(
+        evo2_model.tokenizer.tokenize(test_seq), dtype=torch.int
+    ).unsqueeze(0).to(next(evo2_model.model.parameters()).device)
+
+    with torch.no_grad():
+        try:
+            outputs, embeddings = evo2_model(
+                input_ids, return_embeddings=True,
+                layer_names=["blocks.0.mlp.l3", "blocks.15.mlp.l3", "blocks.28.mlp.l3"]
+            )
+            for layer_name, emb in embeddings.items():
+                nan_count = torch.isnan(emb).sum().item()
+                inf_count = torch.isinf(emb).sum().item()
+                mean_val = emb[~torch.isnan(emb)].mean().item() if nan_count < emb.numel() else float('nan')
+                status = "PASS" if nan_count == 0 and inf_count == 0 else "FAIL"
+                print(f"  [{status}] {layer_name}: "
+                      f"NaN={nan_count}, Inf={inf_count}, mean={mean_val:.4f}")
+            print(f"  Smoke test completed")
+        except Exception as e:
+            print(f"  SMOKE TEST ERROR: {e}")
+            print(f"  Random embeddings may contain NaN — check results carefully")
+
     print(f"  === END SANITY CHECK ===")
 
 
