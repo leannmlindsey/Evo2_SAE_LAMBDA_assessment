@@ -121,26 +121,42 @@ def main():
     cfg = yaml.safe_load(pkgutil.get_data("evo2", config_path))
     cfg = dotdict(cfg)
 
-    print("Creating temp StripedHyena for random state_dict...")
+    # Hybrid approach: randomize PARAMETERS only, keep BUFFERS at pretrained values.
+    # Buffers contain structural values (Hyena filter time constants, rotary freqs,
+    # etc.) that cause NaN if randomized. Parameters are the learned weights.
+    # Using load_state_dict ensures TP-safe replacement (unlike in-place modification).
+
+    print("Creating temp StripedHyena for random parameter values...")
     temp_model = StripedHyena(cfg)
-    random_sd = {k: v.cpu() for k, v in temp_model.state_dict().items()}
+    temp_sd = {k: v.cpu() for k, v in temp_model.state_dict().items()}
     del temp_model
     torch.cuda.empty_cache()
 
-    # Scale down weight matrices to prevent bfloat16 overflow through 32 layers.
-    # Flash attention requires bfloat16, so we can't cast to float32.
-    # Use 0.02 scaling (same as GPT-2/3 init) for numerical stability.
-    WEIGHT_SCALE = 0.02
-    n_scaled = 0
-    for k, v in random_sd.items():
-        if v.dim() >= 2:
-            random_sd[k] = v * WEIGHT_SCALE
-            n_scaled += 1
-    print(f"Random state_dict: {len(random_sd)} keys, "
-          f"scaled {n_scaled} weight matrices by {WEIGHT_SCALE}")
+    # Identify which state_dict keys are parameters vs buffers
+    param_names = set(name for name, _ in model.model.named_parameters())
+    buffer_names = set(name for name, _ in model.model.named_buffers())
+    pretrained_sd = {k: v.cpu() for k, v in model.model.state_dict().items()}
 
-    model.model.load_state_dict(random_sd, strict=True)
-    print("Loaded random state_dict into pretrained backbone")
+    print(f"  State dict: {len(pretrained_sd)} keys")
+    print(f"  Parameters: {len(param_names)}")
+    print(f"  Buffers: {len(buffer_names)}")
+
+    # Build hybrid state dict: random params + pretrained buffers
+    hybrid_sd = {}
+    n_randomized = 0
+    n_kept = 0
+    for k in pretrained_sd:
+        if k in param_names and k in temp_sd:
+            hybrid_sd[k] = temp_sd[k]  # random parameter from temp model
+            n_randomized += 1
+        else:
+            hybrid_sd[k] = pretrained_sd[k]  # keep pretrained buffer
+            n_kept += 1
+
+    print(f"  Randomized {n_randomized} parameters, kept {n_kept} buffers")
+
+    model.model.load_state_dict(hybrid_sd, strict=True)
+    print("Loaded hybrid state_dict into backbone")
     print(f"Model dtype: {next(model.model.parameters()).dtype}")
 
     # ---------------------------------------------------------------
