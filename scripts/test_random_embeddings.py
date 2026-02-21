@@ -127,20 +127,27 @@ def main():
     del temp_model
     torch.cuda.empty_cache()
 
-    print(f"Random state_dict: {len(random_sd)} keys")
+    # Scale down weight matrices to prevent bfloat16 overflow through 32 layers.
+    # Flash attention requires bfloat16, so we can't cast to float32.
+    # Use 0.02 scaling (same as GPT-2/3 init) for numerical stability.
+    WEIGHT_SCALE = 0.02
+    n_scaled = 0
+    for k, v in random_sd.items():
+        if v.dim() >= 2:
+            random_sd[k] = v * WEIGHT_SCALE
+            n_scaled += 1
+    print(f"Random state_dict: {len(random_sd)} keys, "
+          f"scaled {n_scaled} weight matrices by {WEIGHT_SCALE}")
+
     model.model.load_state_dict(random_sd, strict=True)
     print("Loaded random state_dict into pretrained backbone")
-
-    # Cast to float32 to prevent NaN from bfloat16 overflow
-    print("Casting model to float32...")
-    model.model.float()
     print(f"Model dtype: {next(model.model.parameters()).dtype}")
 
     # ---------------------------------------------------------------
     # 3. Extract random embeddings for the same sequences
     # ---------------------------------------------------------------
     print(f"\n{'='*60}")
-    print("STEP 3: Extract random embeddings (float32)")
+    print("STEP 3: Extract random embeddings (bfloat16)")
     print(f"{'='*60}")
 
     random_emb = extract_batch(
