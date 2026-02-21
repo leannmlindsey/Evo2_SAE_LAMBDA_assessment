@@ -571,24 +571,13 @@ def replace_with_random_weights(evo2_model, model_name: str, seed: int = 0) -> N
     cfg = yaml.safe_load(pkgutil.get_data("evo2", config_path))
     cfg = dotdict(cfg)
 
-    # Step 1: Create a temporary StripedHyena on CPU to get properly-initialized
-    # random weights. PyTorch's default init handles each layer type correctly
+    # Step 1: Create a temporary StripedHyena to get properly-initialized random
+    # weights. PyTorch's default init handles each layer type correctly
     # (Xavier for linear, ones for norm scales, etc.)
+    # Note: Vortex will place it on GPU (CUDA is already initialized so we can't
+    # force CPU via env vars). Both models briefly coexist in GPU memory.
     print(f"  Creating temporary StripedHyena for random state_dict (seed={seed})...")
-
-    # Temporarily hide CUDA so the temp model stays on CPU and doesn't compete
-    # for GPU memory with the pretrained model
-    import os
-    original_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
-    try:
-        temp_model = StripedHyena(cfg)
-    finally:
-        # Restore CUDA visibility
-        if original_cuda_visible is not None:
-            os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible
-        else:
-            del os.environ["CUDA_VISIBLE_DEVICES"]
+    temp_model = StripedHyena(cfg)
 
     # Step 2: Extract the random state_dict (parameters + buffers) to CPU
     random_sd = {k: v.cpu() for k, v in temp_model.state_dict().items()}
@@ -602,8 +591,9 @@ def replace_with_random_weights(evo2_model, model_name: str, seed: int = 0) -> N
     # Step 3: Free the temporary model
     del temp_model
 
-    # Step 4: Verify key compatibility before loading
-    pretrained_sd_keys = set(evo2_model.model.state_dict().keys())
+    # Step 4: Verify key compatibility and snapshot pretrained values for comparison
+    pretrained_sd = evo2_model.model.state_dict()
+    pretrained_sd_keys = set(pretrained_sd.keys())
     random_sd_keys = set(random_sd.keys())
     missing = pretrained_sd_keys - random_sd_keys
     unexpected = random_sd_keys - pretrained_sd_keys
@@ -614,20 +604,55 @@ def replace_with_random_weights(evo2_model, model_name: str, seed: int = 0) -> N
         print(f"  WARNING: {len(unexpected)} unexpected keys in random state_dict "
               f"(will be ignored): {list(unexpected)[:5]}...")
 
+    # Save a few pretrained values for comparison after loading
+    check_keys = [k for k in list(random_sd.keys())[:3] if k in pretrained_sd_keys]
+    pretrained_snapshots = {k: pretrained_sd[k].cpu().float().clone() for k in check_keys}
+    pretrained_dtype = pretrained_sd[check_keys[0]].dtype if check_keys else None
+    print(f"  Pretrained model dtype: {pretrained_dtype}")
+
+    del pretrained_sd  # free memory
+
     # Step 5: Load random weights into the existing pretrained backbone.
     # load_state_dict uses .copy_() which preserves device placement and dtype.
-    # strict=False allows partial loading if architectures differ slightly.
     evo2_model.model.load_state_dict(random_sd, strict=(not missing and not unexpected))
     print(f"  Loaded random state_dict into pretrained backbone")
 
-    # Step 6: Sanity check - verify weights actually changed
+    # Step 6: Diagnostic sanity check
     new_sd = evo2_model.model.state_dict()
-    sample_key = next(iter(random_sd))
-    sample_pretrained = new_sd[sample_key].cpu().float()
-    sample_random = random_sd[sample_key].float()
-    match = torch.allclose(sample_pretrained, sample_random, atol=1e-5)
-    print(f"  Sanity check: random weights loaded correctly = {match} "
-          f"(checked key: '{sample_key}')")
+    print(f"\n  === SANITY CHECK ===")
+    for key in check_keys:
+        loaded_vals = new_sd[key].cpu().float()
+        random_vals = random_sd[key].float()
+        pretrained_vals = pretrained_snapshots[key]
+
+        # Check: are loaded values close to the random values we intended?
+        matches_random = torch.allclose(loaded_vals, random_vals, atol=1e-2)
+        # Check: are loaded values still the same as pretrained (i.e. load failed)?
+        matches_pretrained = torch.allclose(loaded_vals, pretrained_vals, atol=1e-5)
+        # Correlation with random target (should be ~1.0 if load worked)
+        flat_loaded = loaded_vals.flatten()[:1000].double()
+        flat_random = random_vals.flatten()[:1000].double()
+        flat_pretrained = pretrained_vals.flatten()[:1000].double()
+        corr_random = torch.corrcoef(torch.stack([flat_loaded, flat_random]))[0, 1].item()
+        corr_pretrained = torch.corrcoef(torch.stack([flat_loaded, flat_pretrained]))[0, 1].item()
+
+        print(f"  Key: '{key}' (shape={list(loaded_vals.shape)}, dtype={new_sd[key].dtype})")
+        print(f"    Matches random target (atol=1e-2): {matches_random}")
+        print(f"    Still matches pretrained (atol=1e-5): {matches_pretrained}")
+        print(f"    Correlation with random target: {corr_random:.6f}")
+        print(f"    Correlation with pretrained: {corr_pretrained:.6f}")
+        print(f"    Loaded sample:     {loaded_vals.flatten()[:5].tolist()}")
+        print(f"    Random target:     {random_vals.flatten()[:5].tolist()}")
+        print(f"    Pretrained before: {pretrained_vals.flatten()[:5].tolist()}")
+
+        if matches_pretrained and not matches_random:
+            print(f"    FAILURE: load_state_dict did NOT change this tensor!")
+        elif matches_random:
+            print(f"    OK: weights successfully replaced")
+        else:
+            print(f"    LIKELY OK: values changed, small differences from dtype "
+                  f"conversion ({pretrained_dtype} roundtrip)")
+    print(f"  === END SANITY CHECK ===")
 
 
 def run_random_baseline(
