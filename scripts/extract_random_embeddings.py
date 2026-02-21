@@ -46,6 +46,8 @@ def parse_args():
     parser.add_argument("--pooling", type=str, default="mean",
                         choices=["mean", "first", "last", "max"])
     parser.add_argument("--max_length", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=16,
+                        help="Number of sequences per batch (for progress tracking)")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 
@@ -89,40 +91,46 @@ def apply_savanna_style_init(state_dict, hidden_size=4096, num_layers=32,
             state_dict[key] = torch.randn_like(tensor) * small_init_std
 
 
-def extract_with_hooks(model, tokenizer, sequences, layer_name, pooling, max_length):
+def extract_with_hooks(model, tokenizer, sequences, layer_name, pooling, max_length,
+                       batch_size=16):
     """Extract embeddings using manual hook registration."""
     all_embeddings = []
-    for seq in tqdm(sequences, desc="Extracting"):
-        if max_length is not None and len(seq) > max_length:
-            seq = seq[:max_length]
-        input_ids = torch.tensor(
-            tokenizer.tokenize(seq), dtype=torch.int
-        ).unsqueeze(0).to(next(model.parameters()).device)
+    device = next(model.parameters()).device
 
-        captured = {}
-        def hook_fn(_, __, output):
-            if isinstance(output, tuple):
-                output = output[0]
-            captured["emb"] = output.detach()
+    for i in tqdm(range(0, len(sequences), batch_size), desc="Extracting embeddings"):
+        batch_seqs = sequences[i:i + batch_size]
 
-        layer = model.get_submodule(layer_name)
-        handle = layer.register_forward_hook(hook_fn)
+        for seq in batch_seqs:
+            if max_length is not None and len(seq) > max_length:
+                seq = seq[:max_length]
+            input_ids = torch.tensor(
+                tokenizer.tokenize(seq), dtype=torch.int
+            ).unsqueeze(0).to(device)
 
-        try:
-            with torch.no_grad():
-                model.forward(input_ids)
-            emb = captured["emb"]
-            if pooling == "mean":
-                pooled = emb.mean(dim=1)
-            elif pooling == "first":
-                pooled = emb[:, 0, :]
-            elif pooling == "last":
-                pooled = emb[:, -1, :]
-            elif pooling == "max":
-                pooled = emb.max(dim=1)[0]
-            all_embeddings.append(pooled.cpu().float().numpy())
-        finally:
-            handle.remove()
+            captured = {}
+            def hook_fn(_, __, output):
+                if isinstance(output, tuple):
+                    output = output[0]
+                captured["emb"] = output.detach()
+
+            layer = model.get_submodule(layer_name)
+            handle = layer.register_forward_hook(hook_fn)
+
+            try:
+                with torch.no_grad():
+                    model.forward(input_ids)
+                emb = captured["emb"]
+                if pooling == "mean":
+                    pooled = emb.mean(dim=1)
+                elif pooling == "first":
+                    pooled = emb[:, 0, :]
+                elif pooling == "last":
+                    pooled = emb[:, -1, :]
+                elif pooling == "max":
+                    pooled = emb.max(dim=1)[0]
+                all_embeddings.append(pooled.cpu().float().numpy())
+            finally:
+                handle.remove()
 
     return np.vstack(all_embeddings)
 
@@ -269,7 +277,8 @@ def main():
         t0 = time.time()
         emb = extract_with_hooks(
             random_model, tokenizer, sequences,
-            args.layer, args.pooling, args.max_length
+            args.layer, args.pooling, args.max_length,
+            batch_size=args.batch_size
         )
         elapsed = time.time() - t0
 
