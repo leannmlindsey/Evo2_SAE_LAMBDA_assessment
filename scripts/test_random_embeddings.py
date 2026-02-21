@@ -132,31 +132,25 @@ def main():
     del temp_model
     torch.cuda.empty_cache()
 
-    # Identify which state_dict keys are parameters vs buffers
+    # Only load random PARAMETERS into the pretrained model. Skip buffers
+    # (structural values like rotary freqs, Hyena filter constants — random
+    # values here cause NaN) and TransformerEngine _extra_state keys
+    # (cause inference-mode errors). strict=False allows missing keys.
     param_names = set(name for name, _ in model.model.named_parameters())
-    buffer_names = set(name for name, _ in model.model.named_buffers())
-    pretrained_sd = {k: v.cpu() for k, v in model.model.state_dict().items()}
 
-    print(f"  State dict: {len(pretrained_sd)} keys")
+    param_only_sd = {}
+    for k, v in temp_sd.items():
+        if k in param_names:
+            param_only_sd[k] = v
+
+    full_sd_keys = set(model.model.state_dict().keys())
+    print(f"  Full state dict: {len(full_sd_keys)} keys")
     print(f"  Parameters: {len(param_names)}")
-    print(f"  Buffers: {len(buffer_names)}")
+    print(f"  Loading {len(param_only_sd)} random parameters "
+          f"(skipping {len(full_sd_keys) - len(param_only_sd)} buffers/extra_state)")
 
-    # Build hybrid state dict: random params + pretrained buffers
-    hybrid_sd = {}
-    n_randomized = 0
-    n_kept = 0
-    for k in pretrained_sd:
-        if k in param_names and k in temp_sd:
-            hybrid_sd[k] = temp_sd[k]  # random parameter from temp model
-            n_randomized += 1
-        else:
-            hybrid_sd[k] = pretrained_sd[k]  # keep pretrained buffer
-            n_kept += 1
-
-    print(f"  Randomized {n_randomized} parameters, kept {n_kept} buffers")
-
-    model.model.load_state_dict(hybrid_sd, strict=True)
-    print("Loaded hybrid state_dict into backbone")
+    model.model.load_state_dict(param_only_sd, strict=False)
+    print("Loaded random parameters into backbone")
     print(f"Model dtype: {next(model.model.parameters()).dtype}")
 
     # ---------------------------------------------------------------
