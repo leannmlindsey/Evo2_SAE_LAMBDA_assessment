@@ -526,39 +526,108 @@ def train_three_layer_nn(
     return metrics, model, scaler, predictions
 
 
-def randomize_model_weights(model, seed: int = 0) -> None:
-    """Randomize all model weights in-place while preserving architecture and tokenizer.
+def replace_with_random_weights(evo2_model, model_name: str, seed: int = 0) -> None:
+    """Replace pretrained weights with random initialization via load_state_dict.
 
-    This creates the proper null baseline for measuring pretraining value:
-    same architecture, same tokenizer, but untrained (random) weights.
-    Different input sequences will still produce different embeddings due to
-    the architecture's inductive biases and the tokenizer's mapping.
+    Creates a temporary StripedHyena from config (which gets PyTorch's correct
+    default initialization for every layer type), extracts its state_dict
+    (parameters AND buffers), then loads it into the existing pretrained backbone.
+
+    Using load_state_dict preserves:
+    - Vortex multi-GPU device placement (copy_ keeps tensors on their devices)
+    - dtype (float16/bfloat16 is preserved, source is cast automatically)
+    - The Evo2 wrapper's internal references to self.model
+
+    The old named_parameters() approach failed because it missed buffers (e.g.
+    Hyena convolution filters, SSM recurrence matrices, positional state) which
+    are included in state_dict but not in named_parameters.
 
     Args:
-        model: Evo2 model object (has .model attribute with the PyTorch model)
+        evo2_model: Evo2 model wrapper object
+        model_name: Model config name (e.g. 'evo2_7b' or 'evo2_7b_base')
         seed: Random seed for reproducible initialization
     """
+    import yaml
+    import pkgutil
+    from evo2.utils import CONFIG_MAP
+    from vortex.model.model import StripedHyena
+    from vortex.model.utils import dotdict
+
     torch.manual_seed(seed)
-    pytorch_model = model.model if hasattr(model, 'model') else model
-    n_params = 0
-    n_norm = 0
-    norm_keywords = ('norm', 'ln', 'scale', 'gain', 'rmsnorm', 'layernorm')
-    for name, param in pytorch_model.named_parameters():
-        with torch.no_grad():
-            if param.dim() >= 2:
-                # Xavier uniform for weight matrices
-                torch.nn.init.xavier_uniform_(param)
-            elif param.dim() == 1:
-                # Norm scale/gain params must be initialized to 1, not 0.
-                # Zeroing them collapses all representations to zero vectors.
-                name_lower = name.lower()
-                if any(kw in name_lower for kw in norm_keywords):
-                    torch.nn.init.ones_(param)
-                    n_norm += param.numel()
-                else:
-                    torch.nn.init.zeros_(param)
-        n_params += param.numel()
-    print(f"  Randomized {n_params:,} parameters ({n_norm:,} norm params set to 1.0)")
+
+    # Resolve config name: CONFIG_MAP may use different key conventions
+    config_name = model_name
+    if config_name not in CONFIG_MAP:
+        config_name = f"{model_name}_base"
+    if config_name not in CONFIG_MAP:
+        raise ValueError(
+            f"Config not found for '{model_name}'. "
+            f"Available configs: {list(CONFIG_MAP.keys())}"
+        )
+
+    config_path = CONFIG_MAP[config_name]
+    print(f"  Loading config from: {config_name} -> {config_path}")
+
+    cfg = yaml.safe_load(pkgutil.get_data("evo2", config_path))
+    cfg = dotdict(cfg)
+
+    # Step 1: Create a temporary StripedHyena on CPU to get properly-initialized
+    # random weights. PyTorch's default init handles each layer type correctly
+    # (Xavier for linear, ones for norm scales, etc.)
+    print(f"  Creating temporary StripedHyena for random state_dict (seed={seed})...")
+
+    # Temporarily hide CUDA so the temp model stays on CPU and doesn't compete
+    # for GPU memory with the pretrained model
+    import os
+    original_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    try:
+        temp_model = StripedHyena(cfg)
+    finally:
+        # Restore CUDA visibility
+        if original_cuda_visible is not None:
+            os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible
+        else:
+            del os.environ["CUDA_VISIBLE_DEVICES"]
+
+    # Step 2: Extract the random state_dict (parameters + buffers) to CPU
+    random_sd = {k: v.cpu() for k, v in temp_model.state_dict().items()}
+
+    n_params = sum(p.numel() for p in temp_model.parameters())
+    n_buffers = sum(b.numel() for b in temp_model.buffers())
+    n_sd_keys = len(random_sd)
+    print(f"  Random state_dict: {n_sd_keys} keys, "
+          f"{n_params:,} parameter elements, {n_buffers:,} buffer elements")
+
+    # Step 3: Free the temporary model
+    del temp_model
+
+    # Step 4: Verify key compatibility before loading
+    pretrained_sd_keys = set(evo2_model.model.state_dict().keys())
+    random_sd_keys = set(random_sd.keys())
+    missing = pretrained_sd_keys - random_sd_keys
+    unexpected = random_sd_keys - pretrained_sd_keys
+    if missing:
+        print(f"  WARNING: {len(missing)} keys in pretrained model missing from random "
+              f"state_dict (will keep pretrained values): {list(missing)[:5]}...")
+    if unexpected:
+        print(f"  WARNING: {len(unexpected)} unexpected keys in random state_dict "
+              f"(will be ignored): {list(unexpected)[:5]}...")
+
+    # Step 5: Load random weights into the existing pretrained backbone.
+    # load_state_dict uses .copy_() which preserves device placement and dtype.
+    # strict=False allows partial loading if architectures differ slightly.
+    evo2_model.model.load_state_dict(random_sd, strict=(not missing and not unexpected))
+    print(f"  Loaded random state_dict into pretrained backbone")
+
+    # Step 6: Sanity check - verify weights actually changed
+    new_sd = evo2_model.model.state_dict()
+    sample_key = next(iter(random_sd))
+    sample_pretrained = new_sd[sample_key].cpu().float()
+    sample_random = random_sd[sample_key].float()
+    match = torch.allclose(sample_pretrained, sample_random, atol=1e-5)
+    print(f"  Sanity check: random weights loaded correctly = {match} "
+          f"(checked key: '{sample_key}')")
 
 
 def run_random_baseline(
@@ -840,8 +909,8 @@ def main():
             print("\n" + "=" * 60)
             print("Extracting embeddings from randomly-initialized model")
             print("=" * 60)
-            print("Randomizing model weights (keeping architecture + tokenizer)...")
-            randomize_model_weights(evo2_model, seed=args.seed + 100)
+            print("Replacing pretrained weights with random initialization...")
+            replace_with_random_weights(evo2_model, args.model, seed=args.seed + 100)
 
             print(f"\nExtracting random model train embeddings...")
             train_random_emb, _ = extract_embeddings(
@@ -877,6 +946,19 @@ def main():
             )
 
             print(f"Random model embedding shape: {test_random_emb.shape}")
+
+            # Sanity check: verify embeddings have variance
+            test_var = np.var(test_random_emb, axis=0).mean()
+            test_range = np.ptp(test_random_emb, axis=0).mean()
+            all_same = np.allclose(test_random_emb[0], test_random_emb[1]) if len(test_random_emb) > 1 else False
+            print(f"  Random embedding sanity check:")
+            print(f"    Mean per-feature variance: {test_var:.6f}")
+            print(f"    Mean per-feature range: {test_range:.6f}")
+            print(f"    First two embeddings identical: {all_same}")
+            if test_var < 1e-10:
+                print(f"  WARNING: Random embeddings have near-zero variance!")
+                print(f"  All sequences are producing the same embedding.")
+                print(f"  First embedding sample (first 10 dims): {test_random_emb[0, :10]}")
 
             # Cache random model embeddings
             np.savez(
