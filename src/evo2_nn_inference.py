@@ -137,6 +137,10 @@ def parse_arguments() -> argparse.Namespace:
         "--save_metrics", action="store_true",
         help="If labels are present, calculate and save metrics to JSON",
     )
+    parser.add_argument(
+        "--save_embeddings", type=str, default=None,
+        help="Path to save extracted embeddings as .npz (for reuse by other classifiers)",
+    )
     return parser.parse_args()
 
 
@@ -274,6 +278,11 @@ def main():
 
         del evo2_model
         torch.cuda.empty_cache()
+
+    # Save embeddings for reuse if requested
+    if args.save_embeddings:
+        np.savez(args.save_embeddings, embeddings=embeddings)
+        print(f"  Saved embeddings to: {args.save_embeddings}")
 
     # Step 2: Load scaler and standardize
     print(f"\nLoading scaler from: {args.scaler_path}")

@@ -214,8 +214,10 @@ while IFS= read -r INPUT_CSV || [ -n "${INPUT_CSV}" ]; do
     fi
 
     # -----------------------------------------------------------
-    # 3-Layer NN Inference
+    # 3-Layer NN Inference (extracts embeddings, saves for LP reuse)
     # -----------------------------------------------------------
+    CACHED_EMB="${OUTPUT_DIR}/${INPUT_BASENAME}_embeddings.npz"
+
     if [ "${RUN_NN}" == "true" ]; then
         NN_OUTPUT="${OUTPUT_DIR}/${INPUT_BASENAME}_nn_predictions.csv"
         echo ""
@@ -223,6 +225,12 @@ while IFS= read -r INPUT_CSV || [ -n "${INPUT_CSV}" ]; do
         echo "[${COUNT}/${NUM_FILES}] NN Inference: ${INPUT_BASENAME}"
         echo "  Output: ${NN_OUTPUT}"
         echo "------------------------------------------------------------"
+
+        # Save embeddings so LP can reuse them
+        SAVE_EMB_FLAG=""
+        if [ "${RUN_LP}" == "true" ]; then
+            SAVE_EMB_FLAG="--save_embeddings ${CACHED_EMB}"
+        fi
 
         python src/evo2_nn_inference.py \
             --input_csv "${INPUT_CSV}" \
@@ -233,11 +241,12 @@ while IFS= read -r INPUT_CSV || [ -n "${INPUT_CSV}" ]; do
             --layer "${LAYER}" \
             --pooling "${POOLING}" \
             --batch_size ${BATCH_SIZE} \
-            --save_metrics
+            --save_metrics \
+            ${SAVE_EMB_FLAG}
     fi
 
     # -----------------------------------------------------------
-    # Linear Probe Inference
+    # Linear Probe Inference (reuses cached embeddings if available)
     # -----------------------------------------------------------
     if [ "${RUN_LP}" == "true" ]; then
         LP_OUTPUT="${OUTPUT_DIR}/${INPUT_BASENAME}_lp_predictions.csv"
@@ -246,6 +255,12 @@ while IFS= read -r INPUT_CSV || [ -n "${INPUT_CSV}" ]; do
         echo "[${COUNT}/${NUM_FILES}] LP Inference: ${INPUT_BASENAME}"
         echo "  Output: ${LP_OUTPUT}"
         echo "------------------------------------------------------------"
+
+        # Use cached embeddings from NN step if available
+        EMB_FLAG=""
+        if [ -f "${CACHED_EMB}" ]; then
+            EMB_FLAG="--embeddings_path ${CACHED_EMB}"
+        fi
 
         python src/evo2_lp_inference.py \
             --input_csv "${INPUT_CSV}" \
@@ -256,7 +271,13 @@ while IFS= read -r INPUT_CSV || [ -n "${INPUT_CSV}" ]; do
             --layer "${LAYER}" \
             --pooling "${POOLING}" \
             --batch_size ${BATCH_SIZE} \
-            --save_metrics
+            --save_metrics \
+            ${EMB_FLAG}
+
+        # Clean up cached embeddings
+        if [ -f "${CACHED_EMB}" ]; then
+            rm "${CACHED_EMB}"
+        fi
     fi
 
 done < "${INPUT_LIST}"
