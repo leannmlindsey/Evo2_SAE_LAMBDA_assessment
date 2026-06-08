@@ -73,12 +73,17 @@ def parse_arguments() -> argparse.Namespace:
         help="Path to input CSV file with 'sequence' column (and optionally 'label')",
     )
     parser.add_argument(
-        "--classifier_path", type=str, required=True,
+        "--classifier_path", type=str, default=None,
         help="Path to trained linear probe (linear_probe.pkl)",
     )
     parser.add_argument(
-        "--scaler_path", type=str, required=True,
+        "--scaler_path", type=str, default=None,
         help="Path to saved StandardScaler (linear_probe_scaler.pkl)",
+    )
+    parser.add_argument(
+        "--checkpoint_path", type=str, default=None,
+        help="Directory containing classifier .pkl and scaler .pkl files. "
+             "Auto-discovers linear_probe.pkl and linear_probe_scaler.pkl.",
     )
     parser.add_argument(
         "--output_csv", type=str, default=None,
@@ -197,6 +202,32 @@ def calculate_metrics(
 
 def main():
     args = parse_arguments()
+
+    # Auto-discover classifier and scaler from --checkpoint_path directory
+    if args.checkpoint_path:
+        cp = args.checkpoint_path
+        if args.classifier_path is None:
+            candidate = os.path.join(cp, "linear_probe.pkl")
+            if os.path.exists(candidate):
+                args.classifier_path = candidate
+            else:
+                raise FileNotFoundError(
+                    f"Could not find linear_probe.pkl in {cp}"
+                )
+        if args.scaler_path is None:
+            candidate = os.path.join(cp, "linear_probe_scaler.pkl")
+            if os.path.exists(candidate):
+                args.scaler_path = candidate
+            else:
+                raise FileNotFoundError(
+                    f"Could not find linear_probe_scaler.pkl in {cp}"
+                )
+
+    # Validate required paths
+    if args.classifier_path is None:
+        raise ValueError("--classifier_path is required (or use --checkpoint_path directory)")
+    if args.scaler_path is None:
+        raise ValueError("--scaler_path is required (or use --checkpoint_path directory)")
 
     print("\n" + "=" * 60)
     print("Evo2 + Linear Probe Inference")

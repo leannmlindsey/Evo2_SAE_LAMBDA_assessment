@@ -25,9 +25,11 @@ Usage:
 import os
 import sys
 import csv
+import json
 import argparse
 import torch
 import numpy as np
+import pandas as pd
 from math import prod
 from pathlib import Path
 from tqdm import tqdm
@@ -215,6 +217,8 @@ def main():
                         help="Save per-segment .npy activation arrays")
     parser.add_argument("--batch_size", type=int, default=1,
                         help="Batch size (default: 1, reserved for future use)")
+    parser.add_argument("--save_metrics", action="store_true",
+                        help="If 'label' column present, calculate and save metrics to JSON")
     args = parser.parse_args()
 
     output_path = Path(args.output)
@@ -304,6 +308,60 @@ def main():
     print(f"\nResults written to {output_path}")
     if act_dir is not None:
         print(f"Activation arrays saved to {act_dir}/")
+
+    # Calculate and save aggregate metrics if labels present
+    has_labels = 'label' in input_columns
+    if has_labels and args.save_metrics:
+        from sklearn.metrics import (
+            accuracy_score, precision_score, recall_score, f1_score,
+            matthews_corrcoef, roc_auc_score, confusion_matrix as sk_confusion_matrix,
+        )
+        labels = np.array([int(row['label']) for row in rows])
+        preds = np.array([int(row.get('_pred_label', 0)) for row in rows])
+
+        # Re-read predictions from the output CSV to get pred_label
+        result_df = pd.read_csv(output_path)
+        labels = result_df['label'].values.astype(int)
+        preds = result_df['pred_label'].values.astype(int)
+
+        tn, fp, fn, tp = sk_confusion_matrix(labels, preds, labels=[0, 1]).ravel()
+        metrics_dict = {
+            "accuracy": float(accuracy_score(labels, preds)),
+            "precision": float(precision_score(labels, preds, zero_division=0)),
+            "recall": float(recall_score(labels, preds, zero_division=0)),
+            "f1": float(f1_score(labels, preds, zero_division=0)),
+            "mcc": float(matthews_corrcoef(labels, preds)),
+            "sensitivity": float(tp / (tp + fn)) if (tp + fn) > 0 else 0.0,
+            "specificity": float(tn / (tn + fp)) if (tn + fp) > 0 else 0.0,
+            "true_positives": int(tp),
+            "true_negatives": int(tn),
+            "false_positives": int(fp),
+            "false_negatives": int(fn),
+            "num_samples": len(labels),
+            "input_csv": args.input_csv,
+            "feature_idx": args.feature_idx,
+            "max_threshold": args.max_threshold,
+            "mean_threshold": args.mean_threshold,
+            "fraction_threshold": args.fraction_threshold,
+        }
+
+        print(f"\n{'=' * 50}")
+        print(f"METRICS")
+        print(f"{'=' * 50}")
+        print(f"  Accuracy:    {metrics_dict['accuracy']:.4f}")
+        print(f"  Precision:   {metrics_dict['precision']:.4f}")
+        print(f"  Recall:      {metrics_dict['recall']:.4f}")
+        print(f"  F1 Score:    {metrics_dict['f1']:.4f}")
+        print(f"  MCC:         {metrics_dict['mcc']:.4f}")
+        print(f"  Sensitivity: {metrics_dict['sensitivity']:.4f}")
+        print(f"  Specificity: {metrics_dict['specificity']:.4f}")
+        print(f"{'=' * 50}")
+
+        metrics_path = str(output_path).replace(".csv", "_metrics.json")
+        with open(metrics_path, "w") as f:
+            json.dump(metrics_dict, f, indent=2)
+        print(f"Saved metrics to: {metrics_path}")
+
     print("Done!")
 
 
