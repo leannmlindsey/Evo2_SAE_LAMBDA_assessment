@@ -7,10 +7,13 @@ Copies ONLY the small result files into STAGE, preserving the
 (embeddings_*.npz, *.pkl, *.pt, *.npy) are never touched.
 
 Staged:
-  *_predictions.csv          -> copied WITHOUT the 'sequence' column
+  *_predictions.csv          -> copied WITHOUT the 'sequence' column (LP / NN, and
+                                renamed SAE under inference/evo2_sae/)
+  *_sae_results.csv          -> SAE results (un-renamed, in _raw/) copied as-is
   *_metrics.json             -> copied as-is
   embedding_analysis_results.json -> copied as-is
 (also picks up partial/un-renamed predictions under inference/_raw/.)
+The large *_activations/ .npy dumps are NEVER staged.
 
 Usage (run on CBB with the evo2 conda env active, so pandas is available):
   python scripts/lambda_replication/stage_results_for_globus.py SRC STAGE
@@ -24,7 +27,9 @@ from pathlib import Path
 
 import pandas as pd
 
-PRED_SUFFIX = "_predictions.csv"
+# Files we rewrite (drop the DNA 'sequence' column if present). SAE result CSVs
+# have no 'sequence' column, so the drop is a harmless no-op for them.
+PRED_SUFFIXES = ("_predictions.csv", "_sae_results.csv")
 COPY_NAMES = {"embedding_analysis_results.json"}
 COPY_SUFFIX = "_metrics.json"
 DROP_COLS = ("sequence",)
@@ -48,7 +53,7 @@ def main():
         name = p.name
         out = stage / p.relative_to(src)
         try:
-            if name.endswith(PRED_SUFFIX):
+            if name.endswith(PRED_SUFFIXES):
                 out.parent.mkdir(parents=True, exist_ok=True)
                 df = pd.read_csv(p)
                 df = df.drop(columns=[c for c in DROP_COLS if c in df.columns])
@@ -65,8 +70,8 @@ def main():
             n_err += 1
             print(f"  WARNING: skipped {p} ({e})")
 
-    print(f"\nstaged {n_pred} predictions (sequence column dropped) "
-          f"+ {n_copy} json/metrics files")
+    print(f"\nstaged {n_pred} prediction/SAE-result CSVs (sequence column dropped "
+          f"where present) + {n_copy} json/metrics files")
     if n_err:
         print(f"  ({n_err} file(s) skipped — see warnings above)")
     print(f"total staged size: {total / 1048576:.1f} MB")
