@@ -34,7 +34,11 @@ HARDCODED="/net/intdev/metagut/lindseylm/LAMBDA_GLMS/Evo2_SAE_LAMBDA_assessment/
 RESULTS="${OUTPUT_DIR:-${HARDCODED}}"
 case "${RESULTS}" in /path/to/*) RESULTS="${HARDCODED}";; esac
 
-STAGE="${1:-${HOME}/evo2_lambda_results_to_send}"
+# Default staging dir: a SIBLING of the results tree (guaranteed writable, and
+# outside it as the stager requires). $HOME is unreliable on this server
+# (/home/<user> may not exist), so derive from RESULTS rather than ~.
+DEFAULT_STAGE="$(dirname "${RESULTS}")/evo2_lambda_results_to_send"
+STAGE="${1:-${DEFAULT_STAGE}}"
 TARBALL="${STAGE}.tar.gz"
 
 # --- deployment-specific conda (module-free) ----------------------------------
