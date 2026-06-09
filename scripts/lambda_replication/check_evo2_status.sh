@@ -68,6 +68,43 @@ else
 fi
 
 # ============================================================================
+# LIVE PROGRESS — files produced in _raw/ BEFORE the end-of-window rename.
+# Each window's outputs sit in <W>/inference/_raw/ until ALL its inputs finish,
+# then get renamed into inference/<variant>/. So during a long run the canonical
+# manifest below reads empty even though work is happening — THIS section is the
+# real-time progress signal. "~N processed" = inputs that have reached their last
+# method; the per-type [sae/nn/lp] counts reveal the file in progress.
+# ============================================================================
+echo ""
+echo "############ LIVE PROGRESS (_raw, current window) ############"
+for W in ${WINDOWS}; do
+    RAW="${RESULTS}/${W}/inference/_raw"
+    LIST="${RESULTS}/_inference_lists/${W}_inputs.txt"
+    EXP="?"
+    [ -f "${LIST}" ] && EXP="$(grep -cv '^[[:space:]]*$' "${LIST}" 2>/dev/null)"
+
+    if [ -d "${RAW}" ]; then
+        shopt -s nullglob
+        sae=("${RAW}"/*_sae_results.csv)
+        nn=("${RAW}"/*_nn_predictions.csv)
+        lp=("${RAW}"/*_lp_predictions.csv)
+        shopt -u nullglob
+        # ~processed = the leading method's count (inputs that reached their last step)
+        m=${#sae[@]}
+        [ ${#nn[@]} -gt "${m}" ] && m=${#nn[@]}
+        [ ${#lp[@]} -gt "${m}" ] && m=${#lp[@]}
+        if [ "${m}" -eq 0 ]; then
+            printf "  %-3s  _raw exists but empty (starting up, or already renamed)\n" "${W}"
+        else
+            printf "  %-3s  ~%s / %s inputs processed    [sae:%s  nn:%s  lp:%s]\n" \
+                   "${W}" "${m}" "${EXP}" "${#sae[@]}" "${#nn[@]}" "${#lp[@]}"
+        fi
+    else
+        printf "  %-3s  not started (no _raw)  [expected inputs: %s]\n" "${W}" "${EXP}"
+    fi
+done
+
+# ============================================================================
 # STAGE 1 — embedding / pretrained-vs-random (per window)
 # ============================================================================
 echo ""
