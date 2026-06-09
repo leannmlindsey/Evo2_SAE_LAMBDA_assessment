@@ -88,6 +88,14 @@ SAE_MAX_THRESHOLD=${SAE_MAX_THRESHOLD:-0.5}
 SAE_MEAN_THRESHOLD=${SAE_MEAN_THRESHOLD:-0.1}
 SAE_FRACTION_THRESHOLD=${SAE_FRACTION_THRESHOLD:-0.3}
 
+# PHASE controls which input surfaces run, so diagnostics can be secured before
+# the (much larger) genome-wide pass on a single GPU:
+#   diag   -> only test/fpr/gc/fnr   (skip genome-wide)
+#   genome -> only genome-wide       (skip diagnostics)
+#   all    -> both (default; original behavior)
+PHASE="${PHASE:-all}"
+case "${PHASE}" in diag|genome|all) ;; *) echo "ERROR: PHASE must be diag|genome|all"; exit 1;; esac
+
 echo "============================================================"
 echo "Evo2 LAMBDA replication — Stage 2: batch inference (lp + nn + sae)"
 echo "============================================================"
@@ -97,6 +105,7 @@ echo "  conda env:       ${CONDA_DEFAULT_ENV:-?}   python: $(command -v python)"
 echo "  MODEL/LAYER:     ${MODEL} / ${LAYER}"
 echo "  SEGMENT_LENGTHS: ${RUN_LENGTHS}"
 echo "  VARIANTS:        ${VARIANTS}"
+echo "  PHASE:           ${PHASE}   (RUN_SAE=${RUN_SAE:-true})"
 echo "============================================================"
 
 NUM_WINDOWS=0
@@ -127,20 +136,25 @@ for W in ${RUN_LENGTHS}; do
     }
 
     # --- diagnostics (Surfaces A + B) ---
-    add_input "${LAMBDA_BASE}/train_val_test/${W}/test.csv"                "test"
-    add_input "${LAMBDA_BASE}/fpr_test/${W}/bacteria_segments_${W}.csv"    "fpr"
-    add_input "${LAMBDA_BASE}/shuffled_controls/${W}/test_shuffled.csv"    "gc_control"
+    if [ "${PHASE}" != "genome" ]; then
+        add_input "${LAMBDA_BASE}/train_val_test/${W}/test.csv"                "test"
+        add_input "${LAMBDA_BASE}/fpr_test/${W}/bacteria_segments_${W}.csv"    "fpr"
+        add_input "${LAMBDA_BASE}/shuffled_controls/${W}/test_shuffled.csv"    "gc_control"
 
-    fnr_var="FNR_${W}"
-    FNR_PATH="${!fnr_var:-}"
-    if [ -n "${FNR_PATH}" ]; then
-        add_input "${FNR_PATH}" "fnr"
+        fnr_var="FNR_${W}"
+        FNR_PATH="${!fnr_var:-}"
+        if [ -n "${FNR_PATH}" ]; then
+            add_input "${FNR_PATH}" "fnr"
+        fi
     fi
 
     # --- genome-wide (Surface C): each CSV stem -> genome_wide_<stem> ---
     gw_var="GENOME_WIDE_${W}"
     GW_PATH="${!gw_var:-}"
     GW_COUNT=0
+    if [ "${PHASE}" = "diag" ]; then
+        GW_PATH=""
+    fi
     if [ -n "${GW_PATH}" ]; then
         if [ -f "${GW_PATH}" ]; then
             stem="$(basename "${GW_PATH}" .csv)"
