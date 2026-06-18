@@ -86,7 +86,10 @@ def load_oracle(oracle_dir, acc):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--oracle_dir", required=True)
+    ap.add_argument("--oracle_dir", default=None,
+                    help="dir of original per-genome SAE CSVs (for PASS/FAIL). "
+                         "If omitted, runs EXTRACT-ONLY: just prints prophage firing "
+                         "(compare by eye to the original ~100%% segs / ~0.36 mean).")
     ap.add_argument("--input_csv", nargs="+", required=True)
     ap.add_argument("--model", default="evo2_7b")
     ap.add_argument("--feature_idx", type=int, default=19746)
@@ -109,26 +112,29 @@ def main():
     print("-" * 95)
 
     for csv_path in args.input_csv:
-        acc = accession(csv_path)
+        acc = accession(csv_path) or os.path.basename(csv_path)
         rows = list(csv.DictReader(open(csv_path)))
-        oracle = load_oracle(args.oracle_dir, acc)
-        if oracle is None:
-            print(f"{acc:<18}  NO ORACLE in {args.oracle_dir} — skipping"); continue
-        proph = [r for r in rows if str(r.get("label", "0")).strip() == "1"]
+        oracle = load_oracle(args.oracle_dir, acc) if args.oracle_dir else None
+        # prophage segments: label==1 (fall back to in_prophage=='yes')
+        proph = [r for r in rows if str(r.get("label", "0")).strip() == "1"
+                 or str(r.get("in_prophage", "")).strip().lower() in ("1", "yes", "true")]
         if args.limit_segments:
             proph = proph[:args.limit_segments]
         if not proph:
-            print(f"{acc:<18}  no prophage segments in input — skipping"); continue
+            print(f"{acc:<18}  no prophage segments (label==1) in input — skipping"); continue
+        if "sequence" not in rows[0]:
+            print(f"{acc:<18}  no 'sequence' column in {csv_path} — skipping"); continue
 
-        # oracle prophage firing (normalization-independent fraction_firing)
-        o_frac, o_fire = [], 0
-        for r in proph:
-            k = (int(r["start"]), int(r["end"]))
-            orow = oracle.get(k)
-            if orow and "fraction_firing" in orow:
-                ff = float(orow["fraction_firing"]); o_frac.append(ff); o_fire += (ff > 0)
-        o_pct = o_fire / len(o_frac) if o_frac else float("nan")
-        o_mean = float(np.mean(o_frac)) if o_frac else float("nan")
+        # oracle prophage firing (normalization-independent fraction_firing), if available
+        o_pct = o_mean = float("nan")
+        if oracle:
+            o_frac, o_fire = [], 0
+            for r in proph:
+                orow = oracle.get((int(r["start"]), int(r["end"])))
+                if orow and orow.get("fraction_firing"):
+                    ff = float(orow["fraction_firing"]); o_frac.append(ff); o_fire += (ff > 0)
+            if o_frac:
+                o_pct = o_fire / len(o_frac); o_mean = float(np.mean(o_frac))
 
         for method in args.methods:
             cap = CAPTURE[method]
@@ -139,10 +145,14 @@ def main():
                 fracs.append(ff); fired += (ff > 0)
             pct = fired / len(fracs)
             mean = float(np.mean(fracs))
-            ok = (pct >= 0.80) and (o_mean > 0) and (abs(mean - o_mean) / o_mean <= 0.30)
-            tag = "PASS" if ok else "FAIL"
-            print(f"{acc:<18}{method:<10}{len(proph):>11}{pct*100:>11.1f}%{mean:>16.4f}"
-                  f"   (oracle: {o_pct*100:.0f}% / {o_mean:.4f})  [{tag}]")
+            if o_mean == o_mean and o_mean > 0:          # have a usable oracle
+                ok = (pct >= 0.80) and (abs(mean - o_mean) / o_mean <= 0.30)
+                tag = "PASS" if ok else "FAIL"
+                ref = f"(oracle: {o_pct*100:.0f}% / {o_mean:.4f})"
+            else:                                         # extract-only
+                tag = "EXTRACT"
+                ref = "(orig ~100% / ~0.36)"
+            print(f"{acc[:18]:<18}{method:<10}{len(proph):>11}{pct*100:>11.1f}%{mean:>16.4f}   {ref}  [{tag}]")
     print("\nInterpretation:")
     print("  - A path that PASSES reproduces the original prophage firing -> use it for the re-run.")
     print("  - If 'forward' FAILS but 'generate' PASSES -> the production forward path is the bug;")
