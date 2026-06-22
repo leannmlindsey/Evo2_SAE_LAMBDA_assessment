@@ -21,21 +21,23 @@ STAGE=$WD/sae_262k_stage
 C=/sw/user/NGC_containers/pytorch_26.01-py3.sif
 
 rm -rf "$STAGE"
-for w in 2k 4k 8k; do
-  dst="$STAGE/EVO2_SAE/$w/inference/EVO2_SAE"
-  mkdir -p "$dst"
-  n=0
-  for f in "$SRC/$w"/*_sae_results.csv; do
-    stem=$(basename "$f" _sae_results.csv)
-    out="$dst/genome_wide_${stem}_predictions.csv"
-    # drop 'sequence' if present; keep everything else (start,end,label,max_activation,...)
-    apptainer exec --cleanenv --bind /work/hdd/bfzj/llindsey1 "$C" python -c \
-"import pandas as pd,sys; d=pd.read_csv(sys.argv[1]); d.drop(columns=['sequence'],errors='ignore').to_csv(sys.argv[2],index=False)" \
-      "$f" "$out"
-    n=$((n+1))
-  done
-  echo "  $w: staged $n genomes -> $dst"
-done
+# Single container launch: loop over all windows/genomes inside one python process
+# (avoids hundreds of apptainer starts -- friendlier on a shared login node).
+apptainer exec --cleanenv --bind /work/hdd/bfzj/llindsey1 "$C" python - "$SRC" "$STAGE" <<'PY'
+import sys, os, glob
+import pandas as pd
+src, stage = sys.argv[1], sys.argv[2]
+for w in ("2k", "4k", "8k"):
+    dst = os.path.join(stage, "EVO2_SAE", w, "inference", "EVO2_SAE")
+    os.makedirs(dst, exist_ok=True)
+    files = sorted(glob.glob(os.path.join(src, w, "*_sae_results.csv")))
+    for f in files:
+        stem = os.path.basename(f)[:-len("_sae_results.csv")]
+        out = os.path.join(dst, f"genome_wide_{stem}_predictions.csv")
+        d = pd.read_csv(f)
+        d.drop(columns=["sequence"], errors="ignore").to_csv(out, index=False)
+    print(f"  {w}: staged {len(files)} genomes -> {dst}")
+PY
 
 cd "$WD"
 tar -czf sae_262k_staged.tar.gz -C "$STAGE" EVO2_SAE
