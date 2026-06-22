@@ -61,11 +61,21 @@ def feats_forward(model, sae, seq):
 
 
 def feats_generate(model, sae, seq):
-    # The notebook's "won't crash" path: recurrent cached generation.
-    _, acts = model.evo_model.generate(
-        [seq], n_tokens=1, cached_generation=True, cache_activations_at=[SAE_LAYER_NAME]
-    )
-    return sae.encode(acts[SAE_LAYER_NAME][0]).cpu().detach().float().numpy()
+    # Notebook's "won't crash" path: recurrent cached generation. Current
+    # Evo2.generate() dropped the cache_activations_at kwarg, so we capture the
+    # blocks-26 output via a forward hook during the generation prefill instead.
+    cache = {}
+    block = model.scope._module_dict[SAE_LAYER_NAME]
+    def _hook(m, inp, out):
+        cache["a"] = (out[0] if isinstance(out, tuple) else out).detach()
+    h = block.register_forward_hook(_hook)
+    try:
+        model.evo_model.generate([seq], n_tokens=1, cached_generation=True)
+    finally:
+        h.remove()
+    if "a" not in cache:
+        raise RuntimeError("blocks-26 hook did not fire during generate()")
+    return sae.encode(cache["a"][0]).cpu().detach().float().numpy()
 
 
 CAPTURE = {"forward": feats_forward, "generate": feats_generate}
