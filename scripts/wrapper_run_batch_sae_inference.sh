@@ -23,7 +23,7 @@ INPUT_LIST="/path/to/input_files.txt"
 OUTPUT_DIR="/path/to/output_directory"
 
 # === OPTIONAL: Model Configuration ===
-MODEL="evo2_7b"                     # evo2_7b or evo2_40b
+MODEL="evo2_7b_262k"                # SAE checkpoint — keep 262k (SAE only fires correctly on evo2_7b_262k)
 
 # === OPTIONAL: SAE Feature Configuration ===
 FEATURE_IDX="19746"                 # SAE feature index (19746 = prophage)

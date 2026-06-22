@@ -44,7 +44,7 @@ nvidia-smi
 echo ""
 
 # Set defaults
-MODEL=${MODEL:-evo2_7b}
+MODEL=${MODEL:-evo2_7b_262k}   # SAE checkpoint — keep 262k (SAE only fires correctly on evo2_7b_262k)
 FEATURE_IDX=${FEATURE_IDX:-19746}
 MAX_THRESHOLD=${MAX_THRESHOLD:-0.5}
 MEAN_THRESHOLD=${MEAN_THRESHOLD:-0.1}

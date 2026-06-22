@@ -15,7 +15,7 @@
 set -e
 
 # Default values
-MODEL="evo2_7b"
+MODEL="evo2_7b_262k"   # SAE checkpoint — keep 262k (SAE only fires correctly on evo2_7b_262k)
 FEATURE_IDX="19746"
 MAX_THRESHOLD="0.5"
 MEAN_THRESHOLD="0.1"
@@ -43,7 +43,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --output_dir DIR          Directory to store all output files"
             echo ""
             echo "Optional arguments:"
-            echo "  --model NAME              Evo2 model: evo2_7b, evo2_40b (default: evo2_7b)"
+            echo "  --model NAME              SAE Evo2 checkpoint (default: evo2_7b_262k — required for the SAE)"
             echo "  --feature_idx N           SAE feature index (default: 19746)"
             echo "  --max_threshold F         Max activation threshold (default: 0.5)"
             echo "  --mean_threshold F        Mean activation threshold (default: 0.1)"

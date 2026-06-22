@@ -328,7 +328,10 @@ def main():
     parser.add_argument("--fasta_dir", type=str, required=True, help="Directory containing FASTA files")
     parser.add_argument("--ground_truth", type=str, required=True, help="Ground truth CSV file")
     parser.add_argument("--output_dir", type=str, default="./lambda_results", help="Output directory")
-    parser.add_argument("--model", type=str, default="evo2_7b", help="Model name (evo2_7b or evo2_40b)")
+    parser.add_argument("--model", type=str, default="evo2_7b_262k",
+                        help="Evo2 checkpoint for SAE extraction (default: evo2_7b_262k). "
+                             "The Goodfire SAE was trained on evo2_7b_262k and only fires "
+                             "correctly on it; evo2_7b silently under-fires. Do not change.")
     parser.add_argument("--window_size", type=int, default=50000, help="Window size for processing")
     parser.add_argument("--startup_trim", type=int, default=10, help="Positions to trim from window start to remove artifacts")
     args = parser.parse_args()

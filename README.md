@@ -56,6 +56,15 @@ This installs: `numpy`, `pandas`, `matplotlib`, `scikit-learn`, `scipy`, `tqdm`,
 
 Run SAE feature extraction on a CSV of short (~2 kb) DNA segments and get per-segment activation metrics.
 
+> **⚠️ Critical — use the `evo2_7b_262k` checkpoint for SAE.** The Goodfire SAE
+> (`Evo-2-Layer-26-Mixed`, feature f/19746) was trained on **`evo2_7b_262k`**
+> activations and only fires correctly on that checkpoint. Running SAE on plain
+> `evo2_7b` silently produces a near-dead signal (the prophage feature drops out of
+> the SAE's BatchTopK-64 selection — prophage `fraction_firing` collapses from ~0.36
+> to ~0). `sae_inference.py` now defaults to `evo2_7b_262k`; do not override it unless
+> your SAE was trained on a different model. (This applies only to the SAE — the
+> linear-probe / 3-layer-NN embedding surfaces use `evo2_7b`, which is correct.)
+
 ### Input CSV format
 
 | Column | Description |
@@ -87,7 +96,7 @@ The input columns are preserved, with these columns appended:
 |----------|---------|-------------|
 | `--input_csv` | *(required)* | Input CSV with columns: segment_id, sequence, label, source |
 | `--output` | *(required)* | Output CSV path |
-| `--model` | `evo2_7b` | Evo2 model name (`evo2_7b` or `evo2_40b`) |
+| `--model` | `evo2_7b_262k` | Evo2 checkpoint the SAE was trained on — **keep this** (see warning above) |
 | `--feature_idx` | `19746` | SAE feature index |
 | `--max_threshold` | `0.5` | Max activation threshold for pred_label |
 | `--mean_threshold` | `0.1` | Mean activation threshold for pred_label |
@@ -206,7 +215,7 @@ Process full bacterial genomes (~1-10 Mb) by sliding a window across the genome 
 | `--fasta_dir` | *(required)* | Directory containing FASTA files (`.fna` or `.fasta`) |
 | `--ground_truth` | *(required)* | Ground truth CSV file |
 | `--output_dir` | `./lambda_results` | Output directory |
-| `--model` | `evo2_7b` | Evo2 model name |
+| `--model` | `evo2_7b_262k` | SAE checkpoint — **keep this** (the SAE only fires correctly on `evo2_7b_262k`) |
 | `--window_size` | `50000` | Window size for processing |
 | `--startup_trim` | `10` | Positions to trim from window start to remove artifacts |
 

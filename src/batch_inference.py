@@ -402,8 +402,18 @@ def parse_args():
     parser.add_argument("--run_nn", action="store_true", help="Run 3-layer NN inference")
     parser.add_argument("--run_lp", action="store_true", help="Run linear probe inference")
 
-    # Model config
-    parser.add_argument("--model", type=str, default="evo2_7b")
+    # Model config.
+    #   --model      : checkpoint for NN/LP EMBEDDING extraction (blocks.28.mlp.l3).
+    #   --sae_model  : checkpoint for SAE extraction. MUST be the model the SAE was
+    #                  trained on (evo2_7b_262k for Goodfire Evo-2-Layer-26-Mixed).
+    # These are DIFFERENT checkpoints: the SAE only fires correctly on evo2_7b_262k,
+    # while the LP/NN classifiers were trained on evo2_7b embeddings. Decoupled so a
+    # single run can't silently extract the SAE from the wrong model.
+    parser.add_argument("--model", type=str, default="evo2_7b",
+                        help="Evo2 checkpoint for NN/LP embedding extraction (default: evo2_7b)")
+    parser.add_argument("--sae_model", type=str, default="evo2_7b_262k",
+                        help="Evo2 checkpoint for SAE extraction (default: evo2_7b_262k; "
+                             "the model the Goodfire SAE was trained on -- do not change)")
     parser.add_argument("--layer", type=str, default="blocks.28.mlp.l3")
     parser.add_argument("--pooling", type=str, default="mean",
                         choices=["mean", "first", "last", "max"])
@@ -444,21 +454,27 @@ def main():
     print("=" * 60)
 
     # ------------------------------------------------------------------
-    # 1. Load Evo2 model (once)
+    # 1. Load Evo2 model(s)
     # ------------------------------------------------------------------
-    print(f"\nLoading Evo2 model: {args.model}")
+    # SAE and NN/LP need DIFFERENT checkpoints (see --sae_model help), so they are
+    # loaded independently. Running --run_sae together with --run_nn/--run_lp loads
+    # two Evo2 models at once (~2x GPU memory); prefer separate invocations unless
+    # you have the headroom.
+    from evo2 import Evo2
+    obs_model = None   # ObservableEvo2 on --sae_model, for the SAE hook
+    evo_model = None   # Evo2 on --model, for NN/LP embedding extraction
 
     if args.run_sae:
-        # SAE needs ObservableEvo2 for hooks
-        obs_model = ObservableEvo2(args.model)
-        # For NN/LP embedding extraction, use the underlying Evo2 model
-        evo_model = obs_model.evo_model
-        print(f"  Loaded ObservableEvo2 (SAE + embedding extraction)")
-    else:
-        from evo2 import Evo2
+        print(f"\nLoading Evo2 for SAE (ObservableEvo2): {args.sae_model}")
+        if "262k" not in args.sae_model:
+            print(f"  WARNING: --sae_model={args.sae_model} is not a 262k checkpoint. "
+                  f"The Goodfire SAE was trained on evo2_7b_262k and may NOT fire "
+                  f"correctly on this model (prophage feature can silently drop out).")
+        obs_model = ObservableEvo2(args.sae_model)
+
+    if args.run_nn or args.run_lp:
+        print(f"\nLoading Evo2 for embeddings: {args.model}")
         evo_model = Evo2(args.model)
-        obs_model = None
-        print(f"  Loaded Evo2 (embedding extraction only)")
 
     # ------------------------------------------------------------------
     # 2. Load SAE if needed

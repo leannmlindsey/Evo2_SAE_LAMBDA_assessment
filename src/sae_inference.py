@@ -203,8 +203,13 @@ def main():
                         help="Input CSV with required column: sequence. All other columns are passed through.")
     parser.add_argument("--output", required=True,
                         help="Output CSV path (e.g. results.csv)")
-    parser.add_argument("--model", default="evo2_7b",
-                        help="Evo2 model name (default: evo2_7b)")
+    parser.add_argument("--model", default="evo2_7b_262k",
+                        help="Evo2 model name (default: evo2_7b_262k). IMPORTANT: the "
+                             "Goodfire SAE (Evo-2-Layer-26-Mixed, f/19746) was trained on "
+                             "evo2_7b_262k activations and ONLY fires correctly on that "
+                             "checkpoint. Using evo2_7b silently produces a near-dead SAE "
+                             "signal (prophage feature drops out of the BatchTopK-64). "
+                             "Do not change this unless you know the SAE matches your model.")
     parser.add_argument("--feature_idx", type=int, default=19746,
                         help="SAE feature index (default: 19746)")
     parser.add_argument("--max_threshold", type=float, default=0.5,
