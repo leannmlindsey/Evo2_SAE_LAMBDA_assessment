@@ -26,6 +26,20 @@ The extraction process is:
 3. Encode the layer-26 activations through the SAE: `features = sae.encode(hidden_states)`
 4. Extract prophage feature: `prophage_signal = features[:, 19746]`
 
+## Data Availability
+
+The LAMBDA benchmark dataset — genome FASTA files, per-window segment CSVs
+(`train_val_test`, `fpr_test`, `fnr_test`, `shuffled_controls`, `genome_wide`), and
+the genome-wide ground truth (`Lambda_Genome_Wide_Evaluation_Test_Set.csv`) — is
+distributed separately from this code repository:
+
+> **Zenodo:** _DOI to be added_ (`10.5281/zenodo.XXXXXXX`)
+
+Download and unpack it, then pass the relevant paths to the scripts (every script
+takes data locations as arguments, e.g. `--ground_truth`, `--fasta_dir`,
+`--input_csv` — none are hardcoded to the repo). The ground truth file is **not**
+shipped in this repo; it lives in the dataset download.
+
 ## Setup & Dependencies
 
 ### Evo2 (GPU inference)

@@ -1,0 +1,35 @@
+# ---- OS / editor junk ----
+.DS_Store
+*.swp
+
+# ---- Local-only (kept as a backup, intentionally not committed) ----
+scripts/pipeline_walkthrough.py
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# ---- Large model / embedding / activation artifacts (never source) ----
+*.npy
+*.npz
+*.pt
+*.pth
+*.pkl
+
+# ---- Data (distributed via Zenodo, not the repo) ----
+ground_truth/
+
+# ---- Generated results / figures / reports (regenerable) ----
+EVO2_repeated_results/
+lambda_results_7b/
+experiments/
+clustering_results_best/
+lambda_plots/
+lambda_plots_thresh7/
+plots/
+categorized_pdfs/
+categorized_pdfs_new/
+categorized_pdfs_test/
+tables/
