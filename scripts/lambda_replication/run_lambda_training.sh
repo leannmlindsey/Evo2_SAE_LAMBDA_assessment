@@ -28,8 +28,13 @@ fi
 
 # --- activation block (module-free conda; server is online) -------------------
 source "${SCRIPT_DIR}/lambda_replication.conf"
-source $(conda info --base)/etc/profile.d/conda.sh
-conda activate "${CONDA_ENV:-evo2-sae}"
+# Delta-AI: when run inside the Apptainer container there is no conda (the
+# container provides python). Export SKIP_CONDA_ACTIVATE=1 to skip activation.
+# Unset (the Biowulf default) -> original module-free conda behavior, unchanged.
+if [ "${SKIP_CONDA_ACTIVATE:-0}" != "1" ]; then
+    source $(conda info --base)/etc/profile.d/conda.sh
+    conda activate "${CONDA_ENV:-evo2-sae}"
+fi
 export PYTHONNOUSERSITE=1
 [ -z "${CUDA_HOME:-}" ] && export CUDA_HOME=$(dirname $(dirname $(which nvcc 2>/dev/null))) 2>/dev/null || true
 cd "${REPO_ROOT}"
